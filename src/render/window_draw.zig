@@ -122,16 +122,14 @@ pub fn appendDrawListToScene(draw_list: []const window.DrawCmd, dst: *scene2d.Sc
                 }, toColor(p.color));
             },
             .polyline => |pl| {
-                var i: usize = 0;
-                while (i + 1 < pl.points.len) : (i += 1) {
-                    try dst.strokeLine(toVec2(pl.points[i]), toVec2(pl.points[i + 1]), pl.thickness, toColor(pl.color));
-                }
+                var path = try polylinePath(dst.allocator, pl.points);
+                defer path.deinit();
+                try dst.strokePathCapJoinMiterLimit(&path, pl.thickness, .butt, .round, 4.0, toColor(pl.color));
             },
             .styled_polyline => |pl| {
-                var i: usize = 0;
-                while (i + 1 < pl.points.len) : (i += 1) {
-                    try strokeLine(dst, pl.points[i], pl.points[i + 1], pl.style, toColor(pl.color));
-                }
+                var path = try polylinePath(dst.allocator, pl.points);
+                defer path.deinit();
+                try strokePath(dst, &path, pl.style, toColor(pl.color));
             },
             .bars => |b| {
                 for (b.values, 0..) |value, i| {
@@ -300,6 +298,17 @@ fn toPath(allocator: std.mem.Allocator, commands: []const window.PathCommand) !s
             .arc_negative => |a| try path.arcNegative(toVec2(a.center), a.radius, a.start_angle, a.end_angle),
             .close => try path.close(),
         }
+    }
+    return path;
+}
+
+fn polylinePath(allocator: std.mem.Allocator, points: []const [2]f32) !scene2d.Path {
+    var path = scene2d.Path.init(allocator);
+    errdefer path.deinit();
+    if (points.len == 0) return path;
+    try path.moveTo(toVec2(points[0]));
+    for (points[1..]) |point| {
+        try path.lineTo(toVec2(point));
     }
     return path;
 }

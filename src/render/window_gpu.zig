@@ -1137,8 +1137,10 @@ pub const ImmediateScene = struct {
                     if (self.vertices.items.len > start) try self.recordBatch(start, current_clip, .shape, null, null);
                 },
                 .stroke_path => |p| {
+                    const shape_start = self.vertices.items.len;
                     const start = self.line_vertices.items.len;
                     try self.pushStrokePath(p.path.commands, p.style, p.color);
+                    if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, current_clip, .shape, null, null);
                     if (self.line_vertices.items.len > start) try self.recordBatch(start, current_clip, .line_aa, null, null);
                 },
                 .rect => |r| {
@@ -1152,8 +1154,10 @@ pub const ImmediateScene = struct {
                     if (self.vertices.items.len > start) try self.recordBatch(start, current_clip, .shape, null, null);
                 },
                 .stroke_rounded_rect => |r| {
+                    const shape_start = self.vertices.items.len;
                     const start = self.line_vertices.items.len;
                     try self.pushStrokeRoundedRect(r.rect, r.radius, r.thickness, r.color);
+                    if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, current_clip, .shape, null, null);
                     if (self.line_vertices.items.len > start) try self.recordBatch(start, current_clip, .line_aa, null, null);
                 },
                 .paint_quad => |q| {
@@ -1191,19 +1195,21 @@ pub const ImmediateScene = struct {
                     if (self.vertices.items.len > start) try self.recordBatch(start, current_clip, .shape, null, null);
                 },
                 .stroke_ellipse => |e| {
+                    const shape_start = self.vertices.items.len;
                     const start = self.line_vertices.items.len;
                     try self.pushStrokeEllipse(e.center, e.radius, e.thickness, e.color);
+                    if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, current_clip, .shape, null, null);
                     if (self.line_vertices.items.len > start) try self.recordBatch(start, current_clip, .line_aa, null, null);
                 },
                 .line => |l| try self.pushBatchedLine(l.a, l.b, l.thickness, l.color, current_clip),
-                .styled_line => |l| try self.pushBatchedLine(l.a, l.b, l.style.width, l.color, current_clip),
+                .styled_line => |l| try self.pushBatchedStyledLine(l.a, l.b, l.style, l.color, current_clip),
                 .point => |p| {
                     const start = self.vertices.items.len;
                     try self.pushPoint(p.pos, p.size, p.color);
                     try self.recordBatch(start, current_clip, .shape, null, null);
                 },
-                .polyline => |pl| try self.pushBatchedPolyline(pl.points, pl.thickness, pl.color, current_clip),
-                .styled_polyline => |pl| try self.pushBatchedPolyline(pl.points, pl.style.width, pl.color, current_clip),
+                .polyline => |pl| try self.pushBatchedPolyline(pl.points, .{ .width = pl.thickness }, pl.color, current_clip),
+                .styled_polyline => |pl| try self.pushBatchedPolyline(pl.points, pl.style, pl.color, current_clip),
                 .bars => |b| {
                     const start = self.vertices.items.len;
                     if (b.values.len == 0) continue;
@@ -1301,14 +1307,19 @@ pub const ImmediateScene = struct {
         if (thickness <= 0.0) return;
         const r = roundedRectRadius(rect, radius);
         if (r <= 0.0) {
-            _ = try self.pushLineAA(.{ rect.x, rect.y }, .{ rect.x + rect.w, rect.y }, thickness, color);
-            _ = try self.pushLineAA(.{ rect.x + rect.w, rect.y }, .{ rect.x + rect.w, rect.y + rect.h }, thickness, color);
-            _ = try self.pushLineAA(.{ rect.x + rect.w, rect.y + rect.h }, .{ rect.x, rect.y + rect.h }, thickness, color);
-            _ = try self.pushLineAA(.{ rect.x, rect.y + rect.h }, .{ rect.x, rect.y }, thickness, color);
+            const points = [_][2]f32{
+                .{ rect.x, rect.y },
+                .{ rect.x + rect.w, rect.y },
+                .{ rect.x + rect.w, rect.y + rect.h },
+                .{ rect.x, rect.y + rect.h },
+            };
+            try self.pushFeatheredPolyline(&points, thickness, color, true);
             return;
         }
         const segments = roundedRectCornerSegments(r);
-        var prev = roundedRectPoint(rect, r, 0.0);
+        var points = try std.ArrayList([2]f32).initCapacity(self.allocator, (segments + 1) * 4);
+        defer points.deinit(self.allocator);
+        try points.append(self.allocator, roundedRectPoint(rect, r, 0.0));
         var corner: usize = 0;
         while (corner < 4) : (corner += 1) {
             var i: usize = 0;
@@ -1316,12 +1327,10 @@ pub const ImmediateScene = struct {
                 if (corner == 0 and i == 0) continue;
                 const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments));
                 const angle = @as(f32, @floatFromInt(corner)) * (std.math.pi * 0.5) + t * (std.math.pi * 0.5);
-                const next = roundedRectPoint(rect, r, angle);
-                _ = try self.pushLineAA(prev, next, thickness, color);
-                prev = next;
+                try points.append(self.allocator, roundedRectPoint(rect, r, angle));
             }
         }
-        _ = try self.pushLineAA(prev, roundedRectPoint(rect, r, 0.0), thickness, color);
+        try self.pushFeatheredPolyline(points.items, thickness, color, true);
     }
 
     pub fn pushLinearGradientRect(self: *ImmediateScene, gradient: window.LinearGradientRect) !void {
@@ -1373,14 +1382,14 @@ pub const ImmediateScene = struct {
     pub fn pushStrokeEllipse(self: *ImmediateScene, center: [2]f32, radius: [2]f32, thickness: f32, color: [4]f32) !void {
         if (radius[0] <= 0.0 or radius[1] <= 0.0 or thickness <= 0.0) return;
         const segments = ellipseSegmentCount(radius);
-        var prev = ellipsePoint(center, radius, 0.0);
-        var i: usize = 1;
-        while (i <= segments) : (i += 1) {
+        var points = try std.ArrayList([2]f32).initCapacity(self.allocator, segments);
+        defer points.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < segments) : (i += 1) {
             const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments));
-            const next = ellipsePoint(center, radius, t * std.math.tau);
-            _ = try self.pushLineAA(prev, next, thickness, color);
-            prev = next;
+            try points.append(self.allocator, ellipsePoint(center, radius, t * std.math.tau));
         }
+        try self.pushFeatheredPolyline(points.items, thickness, color, true);
     }
 
     pub fn pushFillPath(self: *ImmediateScene, commands: []const window.PathCommand, color: [4]f32) !void {
@@ -1401,10 +1410,22 @@ pub const ImmediateScene = struct {
         defer points.deinit(self.allocator);
         try flattenPath(self.allocator, commands, &points);
         if (points.items.len < 2) return;
-        var i: usize = 0;
-        while (i + 1 < points.items.len) : (i += 1) {
-            _ = try self.pushLineAA(points.items[i], points.items[i + 1], style.width, color);
+        if (style.dash.count > 0) {
+            try self.pushDashedPolyline(points.items, style, color, pathClosed(points.items));
+            return;
         }
+        if (strokeQualityUsesFastSegments(style.quality)) {
+            var i: usize = 0;
+            while (i + 1 < points.items.len) : (i += 1) {
+                _ = try self.pushLineAA(points.items[i], points.items[i + 1], style.width, color);
+            }
+            return;
+        }
+        if (style.quality == .vector) {
+            try self.pushVectorPolyline(points.items, style, color, pathClosed(points.items));
+            return;
+        }
+        try self.pushFeatheredPolyline(points.items, style.width, color, pathClosed(points.items));
     }
 
     pub fn pushPoint(self: *ImmediateScene, pos: [2]f32, size: f32, color: [4]f32) !void {
@@ -1450,6 +1471,138 @@ pub const ImmediateScene = struct {
         try self.line_vertices.append(self.allocator, v2);
         try self.line_vertices.append(self.allocator, v3);
         return true;
+    }
+
+    pub fn pushFeatheredPolyline(self: *ImmediateScene, points: []const [2]f32, width: f32, color: [4]f32, closed: bool) !void {
+        if (points.len < 2 or width <= 0.0 or color[3] <= 0.0) return;
+        const point_count = if (closed and pointsEqual(points[0], points[points.len - 1])) points.len - 1 else points.len;
+        if (point_count < 2) return;
+
+        const feather: f32 = 1.0;
+        const thin_line = width <= feather;
+        const alpha_scale = if (thin_line) std.math.clamp(width / feather, 0.0, 1.0) else 1.0;
+        const center_color = scaleColorAlpha(color, alpha_scale);
+        const outer_color = [4]f32{ color[0], color[1], color[2], 0.0 };
+
+        const segment_count = if (closed) point_count else point_count - 1;
+        var segment_index: usize = 0;
+        while (segment_index < segment_count) : (segment_index += 1) {
+            const start_index = segment_index;
+            const end_index = (segment_index + 1) % point_count;
+            const p0 = points[start_index];
+            const p1 = points[end_index];
+            if (!pointFinite(p0) or !pointFinite(p1) or pointsEqual(p0, p1)) continue;
+
+            const outer0 = strokeOffsetAt(points, point_count, start_index, closed, if (thin_line) feather else (width + feather) * 0.5);
+            const outer1 = strokeOffsetAt(points, point_count, end_index, closed, if (thin_line) feather else (width + feather) * 0.5);
+
+            if (thin_line) {
+                try self.pushGradientTriangle(add2(p0, outer0), outer_color, p0, center_color, add2(p1, outer1), outer_color);
+                try self.pushGradientTriangle(p0, center_color, p1, center_color, add2(p1, outer1), outer_color);
+                try self.pushGradientTriangle(p0, center_color, sub2(p0, outer0), outer_color, p1, center_color);
+                try self.pushGradientTriangle(sub2(p0, outer0), outer_color, sub2(p1, outer1), outer_color, p1, center_color);
+            } else {
+                const inner0 = strokeOffsetAt(points, point_count, start_index, closed, (width - feather) * 0.5);
+                const inner1 = strokeOffsetAt(points, point_count, end_index, closed, (width - feather) * 0.5);
+
+                try self.pushQuadGradient(add2(p0, outer0), outer_color, add2(p1, outer1), outer_color, add2(p1, inner1), color, add2(p0, inner0), color);
+                try self.pushQuadGradient(add2(p0, inner0), color, add2(p1, inner1), color, sub2(p1, inner1), color, sub2(p0, inner0), color);
+                try self.pushQuadGradient(sub2(p0, inner0), color, sub2(p1, inner1), color, sub2(p1, outer1), outer_color, sub2(p0, outer0), outer_color);
+            }
+        }
+    }
+
+    pub fn pushVectorPolyline(self: *ImmediateScene, points: []const [2]f32, style: window.StrokeStyle, color: [4]f32, closed: bool) !void {
+        if (points.len < 2 or style.width <= 0.0 or color[3] <= 0.0) return;
+        const point_count = if (closed and pointsEqual(points[0], points[points.len - 1])) points.len - 1 else points.len;
+        if (point_count < 2) return;
+
+        const half_width = style.width * 0.5;
+        const aa: f32 = 0.5;
+        const segment_count = if (closed) point_count else point_count - 1;
+        var segment_index: usize = 0;
+        while (segment_index < segment_count) : (segment_index += 1) {
+            const start_index = segment_index;
+            const end_index = (segment_index + 1) % point_count;
+            const p0 = points[start_index];
+            const p1 = points[end_index];
+            if (!pointFinite(p0) or !pointFinite(p1) or pointsEqual(p0, p1)) continue;
+
+            var start_center = p0;
+            var end_center = p1;
+            const dir = normalize2(.{ p1[0] - p0[0], p1[1] - p0[1] });
+            if (!closed and style.cap == .square) {
+                if (start_index == 0) start_center = sub2(start_center, scale2(dir, half_width));
+                if (end_index == point_count - 1) end_center = add2(end_center, scale2(dir, half_width));
+            }
+
+            const outer0 = strokeOffsetAt(points, point_count, start_index, closed, half_width + aa);
+            const outer1 = strokeOffsetAt(points, point_count, end_index, closed, half_width + aa);
+            const inner0 = strokeOffsetAt(points, point_count, start_index, closed, half_width);
+            const inner1 = strokeOffsetAt(points, point_count, end_index, closed, half_width);
+
+            try self.pushQuadGradient(add2(start_center, outer0), transparentColor(color), add2(end_center, outer1), transparentColor(color), add2(end_center, inner1), color, add2(start_center, inner0), color);
+            try self.pushQuadGradient(add2(start_center, inner0), color, add2(end_center, inner1), color, sub2(end_center, inner1), color, sub2(start_center, inner0), color);
+            try self.pushQuadGradient(sub2(start_center, inner0), color, sub2(end_center, inner1), color, sub2(end_center, outer1), transparentColor(color), sub2(start_center, outer0), transparentColor(color));
+        }
+
+        if (!closed and style.cap == .round) {
+            try self.pushRoundCap(points[0], points[1], half_width, aa, color, true);
+            try self.pushRoundCap(points[point_count - 1], points[point_count - 2], half_width, aa, color, false);
+        }
+    }
+
+    fn pushQuadGradient(
+        self: *ImmediateScene,
+        p0: [2]f32,
+        c0: [4]f32,
+        p1: [2]f32,
+        c1: [4]f32,
+        p2: [2]f32,
+        c2: [4]f32,
+        p3: [2]f32,
+        c3: [4]f32,
+    ) !void {
+        try self.pushGradientTriangle(p0, c0, p1, c1, p2, c2);
+        try self.pushGradientTriangle(p0, c0, p2, c2, p3, c3);
+    }
+
+    fn pushGradientTriangle(
+        self: *ImmediateScene,
+        p0: [2]f32,
+        c0: [4]f32,
+        p1: [2]f32,
+        c1: [4]f32,
+        p2: [2]f32,
+        c2: [4]f32,
+    ) !void {
+        try self.pushTriangle(
+            .{ .pos = p0, .color = c0 },
+            .{ .pos = p1, .color = c1 },
+            .{ .pos = p2, .color = c2 },
+        );
+    }
+
+    fn pushRoundCap(self: *ImmediateScene, center: [2]f32, neighbor: [2]f32, radius: f32, aa: f32, color: [4]f32, start_cap: bool) !void {
+        if (radius <= 0.0) return;
+        const dir = normalize2(.{ center[0] - neighbor[0], center[1] - neighbor[1] });
+        const base_angle = std.math.atan2(dir[1], dir[0]);
+        const start_angle = if (start_cap) base_angle - std.math.pi * 0.5 else base_angle + std.math.pi * 0.5;
+        const sign: f32 = if (start_cap) 1.0 else -1.0;
+        const segments: usize = 10;
+        var prev_inner = add2(center, polar2(start_angle, radius));
+        var prev_outer = add2(center, polar2(start_angle, radius + aa));
+        var i: usize = 1;
+        while (i <= segments) : (i += 1) {
+            const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments));
+            const angle = start_angle + sign * std.math.pi * t;
+            const inner = add2(center, polar2(angle, radius));
+            const outer = add2(center, polar2(angle, radius + aa));
+            try self.pushGradientTriangle(center, color, prev_inner, color, inner, color);
+            try self.pushQuadGradient(prev_inner, color, inner, color, outer, transparentColor(color), prev_outer, transparentColor(color));
+            prev_inner = inner;
+            prev_outer = outer;
+        }
     }
 
     pub fn pushImage(self: *ImmediateScene, image_id: window.ImageId, rect: window.Rect, tint: [4]f32) !void {
@@ -1580,26 +1733,114 @@ pub const ImmediateScene = struct {
     }
 
     fn pushBatchedLine(self: *ImmediateScene, a: [2]f32, b: [2]f32, thickness: f32, color: [4]f32, clip: ?window.Rect) !void {
+        try self.pushBatchedStyledLine(a, b, .{ .width = thickness }, color, clip);
+    }
+
+    fn pushBatchedStyledLine(self: *ImmediateScene, a: [2]f32, b: [2]f32, style: window.StrokeStyle, color: [4]f32, clip: ?window.Rect) !void {
+        if (style.dash.count > 0) {
+            const points = [_][2]f32{ a, b };
+            const shape_start = self.vertices.items.len;
+            const line_start = self.line_vertices.items.len;
+            try self.pushDashedPolyline(&points, style, color, false);
+            if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, clip, .shape, null, null);
+            if (self.line_vertices.items.len > line_start) try self.recordBatch(line_start, clip, .line_aa, null, null);
+            return;
+        }
+        if (style.quality == .vector and style.dash.count == 0) {
+            const points = [_][2]f32{ a, b };
+            const start = self.vertices.items.len;
+            try self.pushVectorPolyline(&points, style, color, false);
+            try self.recordBatch(start, clip, .shape, null, null);
+            return;
+        }
+        if (!strokeQualityUsesFastSegments(style.quality) and style.dash.count == 0) {
+            const points = [_][2]f32{ a, b };
+            const start = self.vertices.items.len;
+            try self.pushFeatheredPolyline(&points, style.width, color, false);
+            try self.recordBatch(start, clip, .shape, null, null);
+            return;
+        }
+
         const start = self.line_vertices.items.len;
-        if (try self.pushLineAA(a, b, thickness, color)) {
+        if (try self.pushLineAA(a, b, style.width, color)) {
             try self.recordBatch(start, clip, .line_aa, null, null);
         } else {
             try self.recordBatch(self.vertices.items.len - 6, clip, .shape, null, null);
         }
     }
 
-    fn pushBatchedPolyline(self: *ImmediateScene, points: []const [2]f32, thickness: f32, color: [4]f32, clip: ?window.Rect) !void {
-        const start = self.line_vertices.items.len;
+    fn pushBatchedPolyline(self: *ImmediateScene, points: []const [2]f32, style: window.StrokeStyle, color: [4]f32, clip: ?window.Rect) !void {
         if (points.len < 2) return;
+        if (style.dash.count > 0) {
+            const shape_start = self.vertices.items.len;
+            const line_start = self.line_vertices.items.len;
+            try self.pushDashedPolyline(points, style, color, false);
+            if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, clip, .shape, null, null);
+            if (self.line_vertices.items.len > line_start) try self.recordBatch(line_start, clip, .line_aa, null, null);
+            return;
+        }
+        if (style.quality == .vector and style.dash.count == 0) {
+            const start = self.vertices.items.len;
+            try self.pushVectorPolyline(points, style, color, false);
+            try self.recordBatch(start, clip, .shape, null, null);
+            return;
+        }
+        if (!strokeQualityUsesFastSegments(style.quality) and style.dash.count == 0) {
+            const start = self.vertices.items.len;
+            try self.pushFeatheredPolyline(points, style.width, color, false);
+            try self.recordBatch(start, clip, .shape, null, null);
+            return;
+        }
+
+        const start = self.line_vertices.items.len;
         var shape_start: ?usize = null;
         var i: usize = 0;
         while (i + 1 < points.len) : (i += 1) {
-            if (!(try self.pushLineAA(points[i], points[i + 1], thickness, color)) and shape_start == null) {
+            if (!(try self.pushLineAA(points[i], points[i + 1], style.width, color)) and shape_start == null) {
                 shape_start = self.vertices.items.len - 6;
             }
         }
         try self.recordBatch(start, clip, .line_aa, null, null);
         if (shape_start) |fallback_start| try self.recordBatch(fallback_start, clip, .shape, null, null);
+    }
+
+    fn pushDashedPolyline(self: *ImmediateScene, points: []const [2]f32, style: window.StrokeStyle, color: [4]f32, closed: bool) !void {
+        if (points.len < 2 or style.dash.count == 0) return;
+        const point_count = if (closed and pointsEqual(points[0], points[points.len - 1])) points.len - 1 else points.len;
+        if (point_count < 2) return;
+        var dash_state = DashState.init(style.dash);
+        const segment_count = if (closed) point_count else point_count - 1;
+        var segment_index: usize = 0;
+        while (segment_index < segment_count) : (segment_index += 1) {
+            const a = points[segment_index];
+            const b = points[(segment_index + 1) % point_count];
+            if (!pointFinite(a) or !pointFinite(b) or pointsEqual(a, b)) continue;
+            const dx = b[0] - a[0];
+            const dy = b[1] - a[1];
+            const len = @sqrt(dx * dx + dy * dy);
+            if (len <= 0.000001) continue;
+            const dir = [2]f32{ dx / len, dy / len };
+            var consumed: f32 = 0.0;
+            while (consumed < len - 0.0001) {
+                const step = @min(dash_state.remaining, len - consumed);
+                if (dash_state.on and step > 0.0001) {
+                    const p0 = add2(a, scale2(dir, consumed));
+                    const p1 = add2(a, scale2(dir, consumed + step));
+                    if (strokeQualityUsesFastSegments(style.quality)) {
+                        _ = try self.pushLineAA(p0, p1, style.width, color);
+                    } else {
+                        const dash_points = [_][2]f32{ p0, p1 };
+                        if (style.quality == .vector) {
+                            try self.pushVectorPolyline(&dash_points, style, color, false);
+                        } else {
+                            try self.pushFeatheredPolyline(&dash_points, style.width, color, false);
+                        }
+                    }
+                }
+                consumed += step;
+                dash_state.advance(step);
+            }
+        }
     }
 };
 
@@ -2340,6 +2581,27 @@ fn clipEqual(a: ?window.Rect, b: ?window.Rect) bool {
     return a.?.x == b.?.x and a.?.y == b.?.y and a.?.w == b.?.w and a.?.h == b.?.h;
 }
 
+fn emptyDefaultFont(_: *anyopaque) ?window.TextFontId {
+    return null;
+}
+
+fn emptyFontMetrics(_: *anyopaque, _: window.TextFontId) ?FontMetrics {
+    return null;
+}
+
+fn emptyResolveGlyph(_: *anyopaque, _: window.TextFontId, _: u21) ?ResolvedTextGlyph {
+    return null;
+}
+
+fn emptyTextProvider() TextProvider {
+    return .{
+        .context = undefined,
+        .defaultFontFn = emptyDefaultFont,
+        .fontMetricsFn = emptyFontMetrics,
+        .resolveGlyphFn = emptyResolveGlyph,
+    };
+}
+
 fn retainedLessThan(_: void, lhs: RetainedNode, rhs: RetainedNode) bool {
     if (lhs.layer == rhs.layer) return lhs.id < rhs.id;
     return lhs.layer < rhs.layer;
@@ -2491,6 +2753,120 @@ fn appendPathPoint(allocator: std.mem.Allocator, out: *std.ArrayList([2]f32), p:
     try out.append(allocator, p);
 }
 
+fn strokeQualityUsesFastSegments(quality: window.StrokeQuality) bool {
+    return quality == .fast;
+}
+
+const DashState = struct {
+    pattern: window.DashPattern,
+    index: usize = 0,
+    remaining: f32 = 0.0,
+    on: bool = true,
+
+    fn init(pattern: window.DashPattern) DashState {
+        var state = DashState{ .pattern = pattern };
+        const total = pattern.totalLength();
+        var offset = if (total > 0.000001) @mod(pattern.offset, total) else 0.0;
+        while (offset > 0.000001 and state.pattern.count > 0) {
+            const segment = @max(state.pattern.segments[state.index], 0.000001);
+            if (offset < segment) {
+                state.remaining = segment - offset;
+                state.on = (state.index % 2) == 0;
+                return state;
+            }
+            offset -= segment;
+            state.index = (state.index + 1) % state.pattern.count;
+        }
+        state.remaining = if (state.pattern.count > 0) @max(state.pattern.segments[state.index], 0.000001) else 0.0;
+        state.on = (state.index % 2) == 0;
+        return state;
+    }
+
+    fn advance(self: *DashState, distance: f32) void {
+        if (self.pattern.count == 0) return;
+        self.remaining -= distance;
+        while (self.remaining <= 0.0001) {
+            self.index = (self.index + 1) % self.pattern.count;
+            self.remaining += @max(self.pattern.segments[self.index], 0.000001);
+            self.on = (self.index % 2) == 0;
+        }
+    }
+};
+
+fn pathClosed(points: []const [2]f32) bool {
+    return points.len > 2 and pointsEqual(points[0], points[points.len - 1]);
+}
+
+fn pointsEqual(a: [2]f32, b: [2]f32) bool {
+    return @abs(a[0] - b[0]) < 0.001 and @abs(a[1] - b[1]) < 0.001;
+}
+
+fn pointFinite(p: [2]f32) bool {
+    return std.math.isFinite(p[0]) and std.math.isFinite(p[1]);
+}
+
+fn scaleColorAlpha(color: [4]f32, alpha_scale: f32) [4]f32 {
+    return .{ color[0], color[1], color[2], color[3] * std.math.clamp(alpha_scale, 0.0, 1.0) };
+}
+
+fn transparentColor(color: [4]f32) [4]f32 {
+    return .{ color[0], color[1], color[2], 0.0 };
+}
+
+fn polar2(angle: f32, radius: f32) [2]f32 {
+    return .{ @cos(angle) * radius, @sin(angle) * radius };
+}
+
+fn add2(a: [2]f32, b: [2]f32) [2]f32 {
+    return .{ a[0] + b[0], a[1] + b[1] };
+}
+
+fn sub2(a: [2]f32, b: [2]f32) [2]f32 {
+    return .{ a[0] - b[0], a[1] - b[1] };
+}
+
+fn scale2(a: [2]f32, factor: f32) [2]f32 {
+    return .{ a[0] * factor, a[1] * factor };
+}
+
+fn length2(a: [2]f32) f32 {
+    return @sqrt(a[0] * a[0] + a[1] * a[1]);
+}
+
+fn normalize2(a: [2]f32) [2]f32 {
+    const len = length2(a);
+    if (len <= 0.000001 or !std.math.isFinite(len)) return .{ 0.0, 0.0 };
+    return .{ a[0] / len, a[1] / len };
+}
+
+fn segmentNormal(a: [2]f32, b: [2]f32) [2]f32 {
+    const dir = normalize2(.{ b[0] - a[0], b[1] - a[1] });
+    return .{ -dir[1], dir[0] };
+}
+
+fn strokeOffsetAt(points: []const [2]f32, point_count: usize, index: usize, closed: bool, radius: f32) [2]f32 {
+    if (point_count < 2 or radius <= 0.0) return .{ 0.0, 0.0 };
+
+    const current = points[index];
+    const has_prev = closed or index > 0;
+    const has_next = closed or index + 1 < point_count;
+
+    if (!has_prev and has_next) return scale2(segmentNormal(current, points[index + 1]), radius);
+    if (has_prev and !has_next) return scale2(segmentNormal(points[index - 1], current), radius);
+
+    const prev_index = if (index == 0) point_count - 1 else index - 1;
+    const next_index = if (index + 1 == point_count) 0 else index + 1;
+    const prev_n = segmentNormal(points[prev_index], current);
+    const next_n = segmentNormal(current, points[next_index]);
+    const miter = normalize2(add2(prev_n, next_n));
+    if (length2(miter) <= 0.000001) return scale2(next_n, radius);
+
+    const denom = miter[0] * next_n[0] + miter[1] * next_n[1];
+    if (@abs(denom) <= 0.2) return scale2(next_n, radius);
+    const miter_len = std.math.clamp(radius / denom, -radius * 3.0, radius * 3.0);
+    return scale2(miter, miter_len);
+}
+
 fn quadPathPoint(a: [2]f32, b: [2]f32, c: [2]f32, t: f32) [2]f32 {
     const mt = 1.0 - t;
     return .{
@@ -2610,11 +2986,153 @@ test "retained store appends sorted retained vertices" {
     try store.updateNode(high, &.{.{ .pos = .{ 10, 0 }, .color = .{ 1, 0, 0, 1 } }});
     try store.updateNode(low, &.{.{ .pos = .{ 1, 0 }, .color = .{ 0, 1, 0, 1 } }});
 
-    var scene = try ImmediateScene.init(std.testing.allocator, 16, 16, 16);
+    var scene = try ImmediateScene.init(std.testing.allocator, 16, 16, 16, 16);
     defer scene.deinit();
     try scene.beginFrame(&.{});
     try store.appendToScene(&scene);
     try std.testing.expectEqual(@as(usize, 2), scene.vertices.items.len);
     try std.testing.expectEqual(@as(f32, 1), scene.vertices.items[0].pos[0]);
     try std.testing.expectEqual(@as(f32, 10), scene.vertices.items[1].pos[0]);
+}
+
+test "window gpu polylines can use continuous feathered mesh" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 512, 16, 16, 64);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    const points = [_][2]f32{
+        .{ 0.0, 0.0 },
+        .{ 8.0, 8.0 },
+        .{ 16.0, 0.0 },
+    };
+    const start = scene.vertices.items.len;
+    try scene.pushFeatheredPolyline(&points, 1.5, .{ 1.0, 0.0, 0.0, 1.0 }, false);
+    try scene.recordBatch(start, null, .shape, null, null);
+
+    try std.testing.expect(scene.vertices.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), scene.line_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
+}
+
+test "window gpu fast polylines keep segment shader path" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 512, 16, 16, 64);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    const points = [_][2]f32{
+        .{ 0.0, 0.0 },
+        .{ 8.0, 8.0 },
+        .{ 16.0, 0.0 },
+    };
+    const start = scene.line_vertices.items.len;
+    var i: usize = 0;
+    while (i + 1 < points.len) : (i += 1) {
+        _ = try scene.pushLineAA(points[i], points[i + 1], 1.5, .{ 1.0, 0.0, 0.0, 1.0 });
+    }
+    try scene.recordBatch(start, null, .line_aa, null, null);
+
+    try std.testing.expectEqual(@as(usize, 0), scene.vertices.items.len);
+    try std.testing.expect(scene.line_vertices.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.line_aa, scene.batches.items[0].kind);
+}
+
+test "window gpu styled lines can opt into fast or feathered quality" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 512, 16, 16, 64);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushDrawList(&.{.{ .styled_line = .{
+        .a = .{ 0.0, 0.0 },
+        .b = .{ 12.0, 0.0 },
+        .style = .{ .width = 1.5, .quality = .feathered },
+        .color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .layer = 0,
+    } }}, emptyTextProvider());
+    try std.testing.expect(scene.vertices.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), scene.line_vertices.items.len);
+    try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
+
+    try scene.beginFrame(&.{});
+    try scene.pushDrawList(&.{.{ .styled_line = .{
+        .a = .{ 0.0, 0.0 },
+        .b = .{ 12.0, 0.0 },
+        .style = .{ .width = 1.5, .quality = .fast },
+        .color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .layer = 0,
+    } }}, emptyTextProvider());
+    try std.testing.expectEqual(@as(usize, 0), scene.vertices.items.len);
+    try std.testing.expect(scene.line_vertices.items.len > 0);
+    try std.testing.expectEqual(BatchKind.line_aa, scene.batches.items[0].kind);
+}
+
+test "window gpu vector polylines use independent stroke mesh" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 1024, 16, 16, 64);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    const points = [_][2]f32{
+        .{ 0.0, 0.0 },
+        .{ 8.0, 8.0 },
+        .{ 16.0, 0.0 },
+    };
+    try scene.pushDrawList(&.{.{ .styled_polyline = .{
+        .points = &points,
+        .style = .{ .width = 2.0, .quality = .vector, .cap = .round, .join = .round },
+        .color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .layer = 0,
+    } }}, emptyTextProvider());
+
+    try std.testing.expect(scene.vertices.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), scene.line_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
+}
+
+test "window gpu dashed lines preserve gaps before batching" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 512, 16, 16, 64);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushDrawList(&.{.{ .styled_line = .{
+        .a = .{ 0.0, 0.0 },
+        .b = .{ 10.0, 0.0 },
+        .style = .{ .width = 1.5, .dash = window.DashPattern.fromPair(2.0, 2.0, 0.0), .quality = .fast },
+        .color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .layer = 0,
+    } }}, emptyTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 0), scene.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 18), scene.line_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.line_aa, scene.batches.items[0].kind);
+}
+
+test "window gpu stroked closed primitives use continuous feathered mesh" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 2048, 16, 16, 256);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushDrawList(&.{
+        .{ .stroke_ellipse = .{
+            .center = .{ 16.0, 16.0 },
+            .radius = .{ 8.0, 6.0 },
+            .thickness = 1.5,
+            .color = .{ 1.0, 0.0, 0.0, 1.0 },
+            .layer = 0,
+        } },
+        .{ .stroke_rounded_rect = .{
+            .rect = .{ .x = 24.0, .y = 8.0, .w = 24.0, .h = 16.0 },
+            .radius = 4.0,
+            .thickness = 1.5,
+            .color = .{ 0.0, 1.0, 0.0, 1.0 },
+            .layer = 0,
+        } },
+    }, emptyTextProvider());
+
+    try std.testing.expect(scene.vertices.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), scene.line_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
 }

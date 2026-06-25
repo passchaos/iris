@@ -75,6 +75,17 @@ pub const StrokeJoin = enum {
     bevel,
 };
 
+pub const StrokeQuality = enum {
+    /// Let the renderer pick the best default for the primitive.
+    auto,
+    /// Fast segment shader path. Best for very dynamic, isolated single segments.
+    fast,
+    /// Continuous feathered geometry inspired by egui/epaint. Best for UI and plots.
+    feathered,
+    /// Vector-style continuous path mesh with explicit joins/caps.
+    vector,
+};
+
 pub const max_dash_segments = 8;
 
 pub const DashPattern = struct {
@@ -110,6 +121,7 @@ pub const StrokeStyle = struct {
     join: StrokeJoin = .miter,
     miter_limit: f32 = 4.0,
     dash: DashPattern = .{},
+    quality: StrokeQuality = .auto,
 };
 
 pub const FillPath = struct {

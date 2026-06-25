@@ -295,7 +295,9 @@ pub const CpuWindowRenderer = struct {
     }
 
     pub fn endFrame(self: *CpuWindowRenderer) !void {
-        drawImmediateCpuCommands(self.draw_cmds.items, &self.target);
+        self.scene.clear();
+        try window_draw.appendDrawListToScene(self.draw_cmds.items, &self.scene);
+        try self.renderer.render2D(&self.scene, &self.target);
         if (self.text_provider) |text_provider| {
             window_draw.drawTextCommandsWithProvider(self.draw_cmds.items, &self.target, text_provider);
         }
