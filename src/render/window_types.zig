@@ -236,7 +236,7 @@ pub const DrawCmd = union(enum) {
     bars: struct { values: []const f32, base: f32, bar_width: f32, origin: [2]f32, color: [4]f32, layer: i32 },
     scatter: struct { points: []const [2]f32, size: f32, color: [4]f32, layer: i32 },
     image: struct { image_id: ImageId, rect: Rect, tint: [4]f32, layer: i32 },
-    text: struct { pos: [2]f32, size: f32, color: [4]f32, text: []const u8, font_id: ?TextFontId, layer: i32 },
+    text: struct { pos: [2]f32, size: f32, color: [4]f32, text: []const u8, font_id: ?TextFontId, rotation: f32 = 0.0, layer: i32 },
     clip_begin: Rect,
     clip_end: void,
 };

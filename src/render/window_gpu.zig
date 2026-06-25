@@ -1469,6 +1469,11 @@ pub const ImmediateScene = struct {
         var it = view.iterator();
         var batch_start = self.text_vertices.items.len;
         var batch_font_id = base_font_id;
+        const rotation = cmd.rotation;
+        const rotate = @abs(rotation) > 0.0001;
+        const cos_r = @cos(rotation);
+        const sin_r = @sin(rotation);
+        const origin = cmd.pos;
         while (it.nextCodepoint()) |cp| {
             if (cp == '\n') {
                 pen_x = line_start_x;
@@ -1488,7 +1493,11 @@ pub const ImmediateScene = struct {
             const gw = resolved.glyph.size[0] * scale;
             const gh = resolved.glyph.size[1] * scale;
             if (gw > 0.0 and gh > 0.0) {
-                try self.pushTextQuad(gx, gy, gw, gh, resolved.glyph.uv0, resolved.glyph.uv1, cmd.color);
+                if (rotate) {
+                    try self.pushTextQuadRotated(gx, gy, gw, gh, resolved.glyph.uv0, resolved.glyph.uv1, cmd.color, origin, cos_r, sin_r);
+                } else {
+                    try self.pushTextQuad(gx, gy, gw, gh, resolved.glyph.uv0, resolved.glyph.uv1, cmd.color);
+                }
             }
             pen_x += resolved.glyph.advance * scale;
         }
@@ -1513,6 +1522,33 @@ pub const ImmediateScene = struct {
         try self.text_vertices.append(self.allocator, v0);
         try self.text_vertices.append(self.allocator, v2);
         try self.text_vertices.append(self.allocator, v3);
+    }
+
+    pub fn pushTextQuadRotated(self: *ImmediateScene, x: f32, y: f32, w: f32, h: f32, uv0: [2]f32, uv1: [2]f32, color: [4]f32, origin: [2]f32, cos_r: f32, sin_r: f32) !void {
+        if (self.text_vertices.items.len + 6 > self.max_text_vertices) return error.VertexBufferOverflow;
+        const p0 = rotateTextPoint(.{ x, y }, origin, cos_r, sin_r);
+        const p1 = rotateTextPoint(.{ x + w, y }, origin, cos_r, sin_r);
+        const p2 = rotateTextPoint(.{ x + w, y + h }, origin, cos_r, sin_r);
+        const p3 = rotateTextPoint(.{ x, y + h }, origin, cos_r, sin_r);
+        const v0 = window.TextVertex{ .pos = p0, .uv = .{ uv0[0], uv0[1] }, .color = color };
+        const v1 = window.TextVertex{ .pos = p1, .uv = .{ uv1[0], uv0[1] }, .color = color };
+        const v2 = window.TextVertex{ .pos = p2, .uv = .{ uv1[0], uv1[1] }, .color = color };
+        const v3 = window.TextVertex{ .pos = p3, .uv = .{ uv0[0], uv1[1] }, .color = color };
+        try self.text_vertices.append(self.allocator, v0);
+        try self.text_vertices.append(self.allocator, v1);
+        try self.text_vertices.append(self.allocator, v2);
+        try self.text_vertices.append(self.allocator, v0);
+        try self.text_vertices.append(self.allocator, v2);
+        try self.text_vertices.append(self.allocator, v3);
+    }
+
+    fn rotateTextPoint(point: [2]f32, origin: [2]f32, cos_r: f32, sin_r: f32) [2]f32 {
+        const dx = point[0] - origin[0];
+        const dy = point[1] - origin[1];
+        return .{
+            origin[0] + dx * cos_r - dy * sin_r,
+            origin[1] + dx * sin_r + dy * cos_r,
+        };
     }
 
     pub fn recordBatch(self: *ImmediateScene, start: usize, clip: ?window.Rect, kind: BatchKind, font_id: ?window.TextFontId, image_id: ?window.ImageId) !void {
