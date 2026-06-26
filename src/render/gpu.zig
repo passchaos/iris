@@ -2116,6 +2116,7 @@ test "README documents current backend contract" {
         "CPU-vs-WebGPU image comparison",
         "max channel error 1",
         "ImageComparison",
+        "compare-2d-webgpu",
         "compare-3d-backends",
         "webgpu-window-skeleton",
         "window-cpu-showcase",

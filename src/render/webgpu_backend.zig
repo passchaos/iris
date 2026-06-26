@@ -31,6 +31,35 @@ const zgpu_wgpu = if (build_options.enable_zgpu_backend) zgpu.wgpu else struct {
         store,
         discard,
     };
+    pub const ShaderModule = *opaque {};
+    pub const CommandEncoder = *opaque {};
+    pub const RenderPassEncoder = *opaque {};
+    pub const Texture = *opaque {};
+    pub const TextureView = *opaque {};
+    pub const TextureAspect = enum(u32) {
+        all,
+    };
+    pub const ImageCopyTexture = extern struct {
+        texture: Texture,
+        mip_level: u32 = 0,
+        origin: Origin3D = .{},
+        aspect: TextureAspect = .all,
+    };
+    pub const TextureDataLayout = extern struct {
+        offset: u64 = 0,
+        bytes_per_row: u32 = 0,
+        rows_per_image: u32 = 0,
+    };
+    pub const Origin3D = extern struct {
+        x: u32 = 0,
+        y: u32 = 0,
+        z: u32 = 0,
+    };
+    pub const Extent3D = extern struct {
+        width: u32 = 1,
+        height: u32 = 1,
+        depth_or_array_layers: u32 = 1,
+    };
     pub const CompareFunction = enum(u32) {
         always,
         less,
@@ -50,22 +79,22 @@ const zgpu_wgpu = if (build_options.enable_zgpu_backend) zgpu.wgpu else struct {
         depth_bias_slope_scale: f32 = 0.0,
         depth_bias_clamp: f32 = 0.0,
     };
-    pub const WgpuColor = extern struct {
+    pub const Color = extern struct {
         r: f64,
         g: f64,
         b: f64,
         a: f64,
     };
-    const TextureView = *opaque {};
     const U32Bool = enum(u32) {
         false = 0,
         true = 1,
     };
     pub const RenderPassColorAttachment = extern struct {
         view: ?TextureView,
+        resolve_target: ?TextureView = null,
         load_op: LoadOp,
         store_op: StoreOp,
-        clear_value: WgpuColor = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 },
+        clear_value: Color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 },
     };
     pub const RenderPassDepthStencilAttachment = extern struct {
         view: TextureView,
@@ -80,22 +109,68 @@ const zgpu_wgpu = if (build_options.enable_zgpu_backend) zgpu.wgpu else struct {
     };
     pub const TextureFormat = enum(u32) {
         rgba8_unorm,
+        bgra8_unorm,
         depth32_float,
     };
+    pub const VertexFormat = enum(u32) {
+        float32,
+        float32x2,
+        float32x4,
+    };
+    pub const VertexStepMode = enum(u32) {
+        vertex,
+    };
+    pub const VertexAttribute = extern struct {
+        format: VertexFormat,
+        offset: u64 = 0,
+        shader_location: u32 = 0,
+    };
+    pub const VertexBufferLayout = extern struct {
+        array_stride: u64 = 0,
+        step_mode: VertexStepMode = .vertex,
+        attribute_count: usize = 0,
+        attributes: [*]const VertexAttribute,
+    };
+    pub const BlendOperation = enum(u32) {
+        add,
+    };
+    pub const BlendFactor = enum(u32) {
+        one,
+        src_alpha,
+        one_minus_src_alpha,
+    };
+    pub const BlendComponent = extern struct {
+        operation: BlendOperation = .add,
+        src_factor: BlendFactor = .one,
+        dst_factor: BlendFactor = .one_minus_src_alpha,
+    };
+    pub const BlendState = extern struct {
+        color: BlendComponent = .{},
+        alpha: BlendComponent = .{},
+    };
+    pub const ColorWriteMask = enum(u32) {
+        all,
+    };
+    pub const ColorTargetState = extern struct {
+        format: TextureFormat,
+        blend: ?*const BlendState = null,
+        write_mask: ColorWriteMask = .all,
+    };
+    pub const FragmentState = extern struct {
+        module: ShaderModule,
+        entry_point: [*:0]const u8,
+        target_count: usize = 0,
+        targets: [*]const ColorTargetState,
+    };
 };
-const Color = @import("color.zig").Color;
+const IrisColor = @import("color.zig").Color;
 const Image = @import("image.zig").Image;
 const Scene2D = @import("scene2d.zig").Scene2D;
 const Scene3D = @import("scene3d.zig").Scene3D;
 
 const render_strips_wgsl =
-    \\struct Strip {
-    \\    xy_width_pad: vec4<u32>,
-    \\    rgba: u32,
-    \\};
-    \\
-    \\@group(0) @binding(0) var<storage, read> strips: array<Strip>;
-    \\@group(0) @binding(1) var target: texture_storage_2d<rgba8unorm, write>;
+    \\@group(0) @binding(0) var<storage, read> strips: array<u32>;
+    \\@group(0) @binding(1) var target_tex: texture_storage_2d<rgba8unorm, write>;
     \\
     \\fn unpack_color(rgba: u32) -> vec4<f32> {
     \\    let r = f32(rgba & 0xffu) / 255.0;
@@ -107,23 +182,23 @@ const render_strips_wgsl =
     \\
     \\@compute @workgroup_size(64)
     \\fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    \\    let strip_ix = gid.x;
-    \\    if (strip_ix >= arrayLength(&strips)) {
+    \\    let strip_ix = gid.x * 3u;
+    \\    if (strip_ix + 2u >= arrayLength(&strips)) {
     \\        return;
     \\    }
     \\
-    \\    let strip = strips[strip_ix];
-    \\    let x0 = strip.xy_width_pad.x;
-    \\    let y = strip.xy_width_pad.y;
-    \\    let width = strip.xy_width_pad.z;
-    \\    let color = unpack_color(strip.rgba);
+    \\    let xy = strips[strip_ix];
+    \\    let x0 = xy & 0xffffu;
+    \\    let y = (xy >> 16u) & 0xffffu;
+    \\    let width = strips[strip_ix + 1u] & 0xffffu;
+    \\    let color = unpack_color(strips[strip_ix + 2u]);
     \\
     \\    var x = 0u;
     \\    loop {
     \\        if (x >= width) {
     \\            break;
     \\        }
-    \\        textureStore(target, vec2<i32>(i32(x0 + x), i32(y)), color);
+    \\        textureStore(target_tex, vec2<i32>(i32(x0 + x), i32(y)), color);
     \\        x = x + 1u;
     \\    }
     \\}
@@ -179,33 +254,7 @@ pub const WebGpuBackend = struct {
     pub const available = false;
     pub const implementation = "zgpu";
     pub const dependency_url = "https://github.com/zig-gamedev/zgpu";
-    pub const wgpu = if (compiled_with_zgpu) zgpu.wgpu else struct {
-        pub const BufferMapAsyncStatus = enum(u32) {
-            success,
-            validation_error,
-        };
-        pub const LoadOp = enum(u32) {
-            undef,
-            clear,
-            load,
-        };
-        pub const StoreOp = enum(u32) {
-            undef,
-            store,
-            discard,
-        };
-        pub const Color = extern struct {
-            r: f64,
-            g: f64,
-            b: f64,
-            a: f64,
-        };
-        pub const TextureFormat = enum(u32) {
-            rgba8_unorm,
-            bgra8_unorm,
-            depth32_float,
-        };
-    };
+    pub const wgpu = zgpu_wgpu;
     pub const GraphicsContext = if (compiled_with_zgpu) zgpu.GraphicsContext else opaque {};
     pub const RenderContext = GraphicsContext;
     pub const GraphicsContextOptions = if (compiled_with_zgpu) zgpu.GraphicsContextOptions else struct {};
@@ -296,6 +345,23 @@ pub const WebGpuBackend = struct {
     pub fn createGraphicsContext(allocator: std.mem.Allocator, provider: WindowProvider, options: GraphicsContextOptions) !*GraphicsContext {
         if (!compiled_with_zgpu) return error.BackendUnavailable;
         return try zgpu.GraphicsContext.create(allocator, provider, options);
+    }
+
+    pub fn syncSwapchainToWindow(gctx: *GraphicsContext) bool {
+        if (comptime !compiled_with_zgpu) return false;
+        const fb_size = gctx.window_provider.fn_getFramebufferSize(gctx.window_provider.window);
+        if (fb_size[0] == 0 or fb_size[1] == 0) return false;
+        if (gctx.swapchain_descriptor.width == fb_size[0] and gctx.swapchain_descriptor.height == fb_size[1]) return false;
+
+        gctx.swapchain_descriptor.width = @intCast(fb_size[0]);
+        gctx.swapchain_descriptor.height = @intCast(fb_size[1]);
+        gctx.swapchain.release();
+        gctx.swapchain = gctx.device.createSwapChain(gctx.surface, gctx.swapchain_descriptor);
+        std.log.info(
+            "[zgpu] Window has been resized to: {d}x{d}.",
+            .{ gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height },
+        );
+        return true;
     }
 
     pub fn createWgslShaderModule(device: anytype, source: [*:0]const u8, label: ?[*:0]const u8) wgpu.ShaderModule {
@@ -1357,7 +1423,7 @@ pub const WebGpuBackend = struct {
             var x: u32 = 0;
             while (x < width) : (x += 1) {
                 const i = row_start + @as(usize, x) * 4;
-                image.writePixel(x, y, Color.rgba(bytes[i + 0], bytes[i + 1], bytes[i + 2], bytes[i + 3]));
+                image.writePixel(x, y, IrisColor.rgba(bytes[i + 0], bytes[i + 1], bytes[i + 2], bytes[i + 3]));
             }
         }
     }
@@ -1745,10 +1811,10 @@ test "WebGPU backend copies padded readback rows into images" {
     bytes[256 + 4 + 3] = 255;
 
     try WebGpuBackend.copyReadbackRowsToImage(&bytes, 2, 2, 256, &image);
-    try @import("std").testing.expectEqual(Color.red, image.pixel(0, 0).?);
-    try @import("std").testing.expectEqual(Color.green, image.pixel(1, 0).?);
-    try @import("std").testing.expectEqual(Color.blue, image.pixel(0, 1).?);
-    try @import("std").testing.expectEqual(Color.white, image.pixel(1, 1).?);
+    try @import("std").testing.expectEqual(IrisColor.red, image.pixel(0, 0).?);
+    try @import("std").testing.expectEqual(IrisColor.green, image.pixel(1, 0).?);
+    try @import("std").testing.expectEqual(IrisColor.blue, image.pixel(0, 1).?);
+    try @import("std").testing.expectEqual(IrisColor.white, image.pixel(1, 1).?);
 }
 
 test "WebGPU readback callback records map status" {

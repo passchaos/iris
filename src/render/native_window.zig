@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cpu = @import("cpu.zig");
 const Color = @import("color.zig").Color;
 const Image = @import("image.zig").Image;
@@ -6,6 +7,13 @@ const scene2d = @import("scene2d.zig");
 const window_types = @import("window_types.zig");
 const window_draw = @import("window_draw.zig");
 const webgpu_backend = @import("webgpu_backend.zig");
+
+const x11 = if (builtin.os.tag == .linux) @cImport({
+    @cInclude("X11/Xlib.h");
+    @cInclude("X11/Xutil.h");
+}) else struct {};
+
+var linux_x11_display: ?*anyopaque = null;
 
 pub const NativeHandle = union(enum) {
     windows: WindowsNativeHandle,
@@ -50,8 +58,8 @@ pub const NativeWindowProvider = struct {
             .fn_getWin32Window = getWin32Window,
             .fn_getX11Display = getX11Display,
             .fn_getX11Window = getX11Window,
-            .fn_getWaylandDisplay = getWaylandDisplay,
-            .fn_getWaylandSurface = getWaylandSurface,
+            .fn_getWaylandDisplay = null,
+            .fn_getWaylandSurface = null,
             .fn_getCocoaWindow = getCocoaWindow,
         };
     }
@@ -91,6 +99,14 @@ pub const WindowRenderContext = struct {
         };
         errdefer context.deinit();
         switch (backend) {
+            .auto => if (webgpu_backend.WebGpuBackend.compiled_with_zgpu) {
+                context.webgpu_context = createWebGpuContext(allocator, native_provider, .{}) catch null;
+                if (context.webgpu_context == null) {
+                    context.cpu_window_renderer = try CpuWindowRenderer.init(allocator, native_provider, width, height);
+                }
+            } else {
+                context.cpu_window_renderer = try CpuWindowRenderer.init(allocator, native_provider, width, height);
+            },
             .gpu => context.webgpu_context = try createWebGpuContext(allocator, native_provider, .{}),
             .cpu => context.cpu_window_renderer = try CpuWindowRenderer.init(allocator, native_provider, width, height),
         }
@@ -99,7 +115,9 @@ pub const WindowRenderContext = struct {
 
     pub fn deinit(self: *WindowRenderContext) void {
         if (self.cpu_window_renderer) |*renderer| renderer.deinit();
-        if (self.webgpu_context) |context| context.destroy(self.allocator);
+        if (webgpu_backend.WebGpuBackend.compiled_with_zgpu) {
+            if (self.webgpu_context) |context| context.destroy(self.allocator);
+        }
         self.allocator.destroy(self.native_provider);
         self.* = undefined;
     }
@@ -133,7 +151,7 @@ fn getWin32Window(window: *const anyopaque) callconv(.c) *anyopaque {
 }
 
 fn getX11Display() callconv(.c) *anyopaque {
-    return undefined;
+    return linux_x11_display orelse undefined;
 }
 
 fn getX11Window(window: *const anyopaque) callconv(.c) u32 {
@@ -169,17 +187,21 @@ pub fn createWebGpuContext(
     native_provider: *const NativeWindowProvider,
     options: webgpu_backend.WebGpuBackend.GraphicsContextOptions,
 ) !*webgpu_backend.WebGpuBackend.GraphicsContext {
+    if (builtin.os.tag == .linux) {
+        const handle = native_provider.get_native_handle(native_provider.app_window);
+        if (handle == .linux) linux_x11_display = handle.linux.x11_display;
+    }
     return try webgpu_backend.WebGpuBackend.createGraphicsContext(allocator, native_provider.webgpuProvider(), options);
 }
 
-pub const CpuPresenter = struct {
+pub const CpuPresenter = if (builtin.os.tag == .macos) struct {
     ns_window: *anyopaque,
     layer: *anyopaque,
     bitmap: ?*anyopaque = null,
     bitmap_width: u32 = 0,
     bitmap_height: u32 = 0,
 
-    pub fn init(native_provider: *const NativeWindowProvider) !CpuPresenter {
+    pub fn init(_: std.mem.Allocator, native_provider: *const NativeWindowProvider) !CpuPresenter {
         const handle = native_provider.get_native_handle(native_provider.app_window);
         const ns_window = switch (handle) {
             .macos => |mac| mac.nswindow orelse return error.MissingNativeWindow,
@@ -248,6 +270,101 @@ pub const CpuPresenter = struct {
         self.bitmap_width = width;
         self.bitmap_height = height;
     }
+} else if (builtin.os.tag == .linux) struct {
+    display: *x11.Display,
+    window: x11.Window,
+    gc: x11.GC,
+    screen: c_int,
+    visual: *x11.Visual,
+    depth: c_uint,
+    buffer: []u8 = &.{},
+    width: u32 = 0,
+    height: u32 = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, native_provider: *const NativeWindowProvider) !CpuPresenter {
+        const handle = native_provider.get_native_handle(native_provider.app_window);
+        const linux = switch (handle) {
+            .linux => |value| value,
+            else => return error.UnsupportedPlatform,
+        };
+        const display: *x11.Display = @ptrCast(@alignCast(linux.x11_display orelse return error.MissingNativeWindow));
+        if (linux.x11_window == 0) return error.MissingNativeWindow;
+        const window: x11.Window = @intCast(linux.x11_window);
+        const screen = x11.XDefaultScreen(display);
+        return .{
+            .display = display,
+            .window = window,
+            .gc = x11.XDefaultGC(display, screen),
+            .screen = screen,
+            .visual = x11.XDefaultVisual(display, screen),
+            .depth = @intCast(x11.XDefaultDepth(display, screen)),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *CpuPresenter) void {
+        self.allocator.free(self.buffer);
+        self.* = undefined;
+    }
+
+    pub fn present(self: *CpuPresenter, image: *const Image) !void {
+        try self.ensureBuffer(image.width, image.height);
+        copyImageToBgra(image, self.buffer);
+        var ximage = x11.XImage{
+            .width = @intCast(image.width),
+            .height = @intCast(image.height),
+            .xoffset = 0,
+            .format = x11.ZPixmap,
+            .data = @ptrCast(self.buffer.ptr),
+            .byte_order = x11.LSBFirst,
+            .bitmap_unit = 32,
+            .bitmap_bit_order = x11.LSBFirst,
+            .bitmap_pad = 32,
+            .depth = @intCast(self.depth),
+            .bytes_per_line = @intCast(image.width * 4),
+            .bits_per_pixel = 32,
+            .red_mask = 0x00ff0000,
+            .green_mask = 0x0000ff00,
+            .blue_mask = 0x000000ff,
+            .obdata = null,
+            .f = undefined,
+        };
+        _ = x11.XInitImage(&ximage);
+        _ = x11.XPutImage(self.display, self.window, self.gc, &ximage, 0, 0, 0, 0, image.width, image.height);
+        _ = x11.XFlush(self.display);
+    }
+
+    fn ensureBuffer(self: *CpuPresenter, width: u32, height: u32) !void {
+        if (width == 0 or height == 0) return error.InvalidImageSize;
+        if (self.width == width and self.height == height and self.buffer.len == @as(usize, width) * height * 4) return;
+        self.allocator.free(self.buffer);
+        self.buffer = try self.allocator.alloc(u8, @as(usize, width) * @as(usize, height) * 4);
+        self.width = width;
+        self.height = height;
+    }
+
+    fn copyImageToBgra(image: *const Image, out: []u8) void {
+        for (image.pixels, 0..) |pixel, i| {
+            const base = i * 4;
+            out[base + 0] = pixel.b;
+            out[base + 1] = pixel.g;
+            out[base + 2] = pixel.r;
+            out[base + 3] = pixel.a;
+        }
+    }
+} else struct {
+    pub fn init(_: std.mem.Allocator, _: *const NativeWindowProvider) !CpuPresenter {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn deinit(self: *CpuPresenter) void {
+        self.* = undefined;
+    }
+
+    pub fn present(_: *CpuPresenter, _: *const Image) !void {
+        return error.UnsupportedPlatform;
+    }
 };
 
 pub const CpuWindowRenderer = struct {
@@ -258,16 +375,22 @@ pub const CpuWindowRenderer = struct {
     draw_cmds: std.ArrayList(window_types.DrawCmd),
     renderer: cpu.CpuRenderer,
     text_provider: ?window_draw.TextAtlasProvider = null,
+    image_provider: ?window_draw.ImageProvider = null,
+    scale_factor: f32 = 1.0,
 
     pub fn init(allocator: std.mem.Allocator, native_provider: *const NativeWindowProvider, width: u32, height: u32) !CpuWindowRenderer {
         return .{
             .allocator = allocator,
-            .presenter = try CpuPresenter.init(native_provider),
+            .presenter = try CpuPresenter.init(allocator, native_provider),
             .target = try Image.init(allocator, width, height, .transparent),
             .scene = scene2d.Scene2D.init(allocator),
             .draw_cmds = try std.ArrayList(window_types.DrawCmd).initCapacity(allocator, 512),
             .renderer = cpu.CpuRenderer.init(allocator),
         };
+    }
+
+    pub fn setScaleFactor(self: *CpuWindowRenderer, scale_factor: f32) void {
+        self.scale_factor = @max(0.25, scale_factor);
     }
 
     pub fn deinit(self: *CpuWindowRenderer) void {
@@ -294,13 +417,21 @@ pub const CpuWindowRenderer = struct {
         self.text_provider = text_provider;
     }
 
+    pub fn setImageProvider(self: *CpuWindowRenderer, image_provider: window_draw.ImageProvider) void {
+        self.image_provider = image_provider;
+    }
+
     pub fn endFrame(self: *CpuWindowRenderer) !void {
         self.scene.clear();
-        try window_draw.appendDrawListToScene(self.draw_cmds.items, &self.scene);
-        try self.renderer.render2D(&self.scene, &self.target);
-        if (self.text_provider) |text_provider| {
-            window_draw.drawTextCommandsWithProvider(self.draw_cmds.items, &self.target, text_provider);
-        }
+        try window_draw.renderDrawListCpu(
+            self.draw_cmds.items,
+            &self.scene,
+            &self.renderer,
+            &self.target,
+            self.text_provider,
+            self.image_provider,
+            self.scale_factor,
+        );
         try self.presenter.present(&self.target);
     }
 
@@ -542,19 +673,23 @@ fn channelToByte(value: f32) u8 {
 }
 
 fn backingScaleFactor(ns_window: *anyopaque) f64 {
+    if (builtin.os.tag != .macos) return 1.0;
     return msgSend(ns_window, "backingScaleFactor", .{}, f64);
 }
 
-const objc = struct {
+const objc = if (builtin.os.tag == .macos) struct {
     const SEL = ?*opaque {};
     const Class = ?*opaque {};
 
     extern fn sel_getUid(str: [*:0]const u8) SEL;
     extern fn objc_getClass(name: [*:0]const u8) Class;
     extern fn objc_msgSend() void;
+} else struct {
+    const SEL = ?*opaque {};
 };
 
 fn msgSend(obj: anytype, sel_name: [:0]const u8, args: anytype, comptime ReturnType: type) ReturnType {
+    if (builtin.os.tag != .macos) @compileError("msgSend requires macOS");
     const args_meta = @typeInfo(@TypeOf(args)).@"struct".fields;
     const FnType = switch (args_meta.len) {
         0 => *const fn (@TypeOf(obj), objc.SEL) callconv(.c) ReturnType,

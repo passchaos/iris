@@ -2,7 +2,12 @@ const std = @import("std");
 const backend = @import("webgpu_backend.zig").WebGpuBackend;
 const window = @import("window_types.zig");
 const window_draw = @import("window_draw.zig");
+const window_lower = @import("window_lower.zig");
 const cangjie = @import("cangjie");
+const Color = @import("color.zig").Color;
+const Image = @import("image.zig").Image;
+const cpu = @import("cpu.zig");
+const scene2d = @import("scene2d.zig");
 
 const wgpu = backend.wgpu;
 
@@ -43,6 +48,7 @@ const ImageResource = struct {
     id: window.ImageId,
     width: u32,
     height: u32,
+    pixels: []Color,
     gpu_texture: ?TextureResource,
 };
 
@@ -57,10 +63,15 @@ pub const ImageStore = struct {
     }
 
     pub fn deinit(self: *ImageStore) void {
-        if (self.gpu_context) |ctx| {
-            for (self.images.items) |*image| {
-                if (image.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
+        if (backend.compiled_with_zgpu) {
+            if (self.gpu_context) |ctx| {
+                for (self.images.items) |*image| {
+                    if (image.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
+                }
             }
+        }
+        for (self.images.items) |*image| {
+            self.allocator.free(image.pixels);
         }
         self.images.deinit(self.allocator);
         self.* = undefined;
@@ -76,17 +87,26 @@ pub const ImageStore = struct {
         const required = @as(usize, width) * @as(usize, height) * 4;
         if (rgba_pixels.len != required) return error.InvalidImagePixels;
         const id: window.ImageId = @intCast(self.images.items.len);
+        const pixels = try self.allocator.alloc(Color, @as(usize, width) * @as(usize, height));
+        errdefer self.allocator.free(pixels);
+        copyRgba8ToColors(pixels, rgba_pixels);
         var image = ImageResource{
             .id = id,
             .width = width,
             .height = height,
-            .gpu_texture = if (self.gpu_context) |ctx| blk: {
-                const layout = self.texture_bind_group_layout orelse return error.InvalidRendererState;
-                break :blk createTextureResource(ctx, layout, width, height, .rgba);
-            } else null,
+            .pixels = pixels,
+            .gpu_texture = if (backend.compiled_with_zgpu)
+                if (self.gpu_context) |ctx| blk: {
+                    const layout = self.texture_bind_group_layout orelse return error.InvalidRendererState;
+                    break :blk createTextureResource(ctx, layout, width, height, .rgba);
+                } else null
+            else
+                null,
         };
-        errdefer if (self.gpu_context) |ctx| {
-            if (image.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
+        errdefer if (backend.compiled_with_zgpu) {
+            if (self.gpu_context) |ctx| {
+                if (image.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
+            }
         };
         try self.uploadImagePixels(&image, rgba_pixels);
         try self.images.append(self.allocator, image);
@@ -96,6 +116,7 @@ pub const ImageStore = struct {
     pub fn updateImage(self: *ImageStore, image_id: window.ImageId, width: u32, height: u32, rgba_pixels: []const u8) !void {
         const image = self.imageById(image_id) orelse return error.InvalidImageId;
         try validateImageUpdate(image.width, image.height, width, height, rgba_pixels.len);
+        copyRgba8ToColors(image.pixels, rgba_pixels);
         try self.uploadImagePixels(image, rgba_pixels);
     }
 
@@ -113,6 +134,23 @@ pub const ImageStore = struct {
         return image.gpu_texture;
     }
 
+    pub fn cpuProvider(self: *ImageStore) window_draw.ImageProvider {
+        return .{
+            .context = self,
+            .imageFn = cpuImageForProvider,
+        };
+    }
+
+    pub fn cpuImageForId(self: *ImageStore, image_id: window.ImageId) ?Image {
+        const image = self.imageById(image_id) orelse return null;
+        return Image{
+            .allocator = self.allocator,
+            .width = image.width,
+            .height = image.height,
+            .pixels = image.pixels,
+        };
+    }
+
     fn imageById(self: *ImageStore, image_id: window.ImageId) ?*ImageResource {
         const idx: usize = @intCast(image_id);
         if (idx >= self.images.items.len) return null;
@@ -120,9 +158,22 @@ pub const ImageStore = struct {
     }
 
     fn uploadImagePixels(self: *ImageStore, image: *ImageResource, rgba_pixels: []const u8) !void {
+        if (!backend.compiled_with_zgpu) return;
         const gctx = self.gpu_context orelse return;
         const texture = image.gpu_texture orelse return error.InvalidImageId;
         try uploadRgbaPixels(self.allocator, gctx, texture, rgba_pixels);
+    }
+
+    fn copyRgba8ToColors(out: []Color, rgba_pixels: []const u8) void {
+        for (out, 0..) |*pixel, i| {
+            const base = i * 4;
+            pixel.* = Color.rgba(rgba_pixels[base + 0], rgba_pixels[base + 1], rgba_pixels[base + 2], rgba_pixels[base + 3]);
+        }
+    }
+
+    fn cpuImageForProvider(context: *anyopaque, image_id: window.ImageId) ?Image {
+        const store: *ImageStore = @ptrCast(@alignCast(context));
+        return store.cpuImageForId(image_id);
     }
 };
 
@@ -225,19 +276,24 @@ pub const WindowRenderer = struct {
         gctx: ?*backend.RenderContext,
         framebuffer_size: [2]u32,
     ) !WindowRenderer {
-        const max_vertices: u32 = 65536;
-        const max_paint_quad_vertices: u32 = 65536;
-        const max_text_vertices: u32 = 65536;
-        const max_line_vertices: u32 = 65536;
+        const max_vertices: u32 = 262144;
+        const max_paint_quad_vertices: u32 = 262144;
+        const max_text_vertices: u32 = 262144;
+        const max_line_vertices: u32 = 262144;
         const scene = try ImmediateScene.init(allocator, max_vertices, max_paint_quad_vertices, max_text_vertices, max_line_vertices);
         const retained_store = try RetainedStore.init(allocator);
-        const gpu_renderer = if (gctx) |ctx| try GpuImmediateRenderer.init(ctx, max_vertices, max_paint_quad_vertices, max_text_vertices, max_line_vertices) else null;
+        const gpu_renderer = if (backend.compiled_with_zgpu)
+            if (gctx) |ctx| try GpuImmediateRenderer.init(ctx, max_vertices, max_paint_quad_vertices, max_text_vertices, max_line_vertices) else null
+        else
+            null;
         var text_store = try TextAtlasStore.init(allocator);
         var image_store = try ImageStore.init(allocator);
-        if (gctx) |ctx| {
-            if (gpu_renderer) |gpu| {
-                text_store.setGpuContext(ctx, gpu.texture_bind_group_layout);
-                image_store.setGpuContext(ctx, gpu.texture_bind_group_layout);
+        if (backend.compiled_with_zgpu) {
+            if (gctx) |ctx| {
+                if (gpu_renderer) |gpu| {
+                    text_store.setGpuContext(ctx, gpu.texture_bind_group_layout);
+                    image_store.setGpuContext(ctx, gpu.texture_bind_group_layout);
+                }
             }
         }
         var renderer = WindowRenderer{
@@ -258,8 +314,10 @@ pub const WindowRenderer = struct {
         self.text_store.processRetiredFonts(self.frame_index, true);
         self.text_store.deinit();
         self.image_store.deinit();
-        if (gctx) |ctx| {
-            if (self.gpu_renderer) |*gpu_renderer| gpu_renderer.deinit(ctx);
+        if (backend.compiled_with_zgpu) {
+            if (gctx) |ctx| {
+                if (self.gpu_renderer) |*gpu_renderer| gpu_renderer.deinit(ctx);
+            }
         }
         self.retained_store.deinit();
         self.scene.deinit();
@@ -274,6 +332,10 @@ pub const WindowRenderer = struct {
         return self.text_store.cpuProvider();
     }
 
+    pub fn cpuImageProvider(self: *WindowRenderer) window_draw.ImageProvider {
+        return self.image_store.cpuProvider();
+    }
+
     pub fn endCpuFrame(self: *WindowRenderer) void {
         if (!self.frame_active) return;
         self.frame_index += 1;
@@ -282,10 +344,12 @@ pub const WindowRenderer = struct {
     pub fn beginGpuFrame(self: *WindowRenderer, gctx: *backend.RenderContext, logical_size: [2]u32, framebuffer_size: [2]u32) !void {
         self.text_store.processRetiredFonts(self.frame_index, false);
         self.frame_active = false;
-        if (self.gpu_renderer) |*gpu_renderer| {
-            self.frame_active = gpu_renderer.beginFrame(gctx, logical_size);
-        } else {
-            return;
+        if (backend.compiled_with_zgpu) {
+            if (self.gpu_renderer) |*gpu_renderer| {
+                self.frame_active = gpu_renderer.beginFrame(gctx, logical_size);
+            } else {
+                return;
+            }
         }
         if (!self.frame_active) return;
         try self.scene.beginFrame(&.{});
@@ -295,19 +359,21 @@ pub const WindowRenderer = struct {
 
     pub fn endGpuFrame(self: *WindowRenderer, gctx: *backend.RenderContext, scale_factor: f32) void {
         if (!self.frame_active) return;
-        if (self.gpu_renderer) |*gpu_renderer| {
-            gpu_renderer.endFrame(
-                gctx,
-                self.scene.vertices.items,
-                self.scene.paint_quad_vertices.items,
-                self.scene.text_vertices.items,
-                self.scene.line_vertices.items,
-                self.scene.batches.items,
-                self.last_fb_size,
-                scale_factor,
-                self,
-                resolveWindowBatchTexture,
-            );
+        if (backend.compiled_with_zgpu) {
+            if (self.gpu_renderer) |*gpu_renderer| {
+                gpu_renderer.endFrame(
+                    gctx,
+                    self.scene.vertices.items,
+                    self.scene.paint_quad_vertices.items,
+                    self.scene.text_vertices.items,
+                    self.scene.line_vertices.items,
+                    self.scene.batches.items,
+                    self.last_fb_size,
+                    scale_factor,
+                    self,
+                    resolveWindowBatchTexture,
+                );
+            }
         }
         self.frame_index += 1;
     }
@@ -767,14 +833,17 @@ pub const TextAtlasStore = struct {
     }
 
     fn createGpuTexture(self: *TextAtlasStore, width: u32, height: u32) ?TextureResource {
+        if (!backend.compiled_with_zgpu) return null;
         const gctx = self.gpu_context orelse return null;
         const layout = self.texture_bind_group_layout orelse return null;
         return createTextureResource(gctx, layout, width, height, .alpha);
     }
 
     fn destroyFontResources(self: *TextAtlasStore, font_value: *TextFont) void {
-        if (self.gpu_context) |ctx| {
-            if (font_value.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
+        if (backend.compiled_with_zgpu) {
+            if (self.gpu_context) |ctx| {
+                if (font_value.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
+            }
         }
         if (font_value.parsed_font) |*parsed_font| parsed_font.deinit();
         if (font_value.font_data) |font_data| self.allocator.free(font_data);
@@ -807,6 +876,7 @@ pub const TextAtlasStore = struct {
     }
 
     fn uploadAtlas(self: *TextAtlasStore, font_value: *const TextFont, x: u32, y: u32, w: u32, h: u32) void {
+        if (!backend.compiled_with_zgpu) return;
         const gctx = self.gpu_context orelse return;
         const texture = font_value.gpu_texture orelse return;
         uploadAlphaAtlas(gctx, texture, font_value.atlas_pixels, font_value.atlas_w, font_value.atlas_h, x, y, w, h);
@@ -1126,113 +1196,8 @@ pub const ImmediateScene = struct {
     }
 
     pub fn pushDrawList(self: *ImmediateScene, cmds: []const window.DrawCmd, text_provider: TextProvider) !void {
-        var current_clip: ?window.Rect = null;
-        for (cmds) |cmd| {
-            switch (cmd) {
-                .clip_begin => |r| current_clip = r,
-                .clip_end => current_clip = null,
-                .fill_path => |p| {
-                    const start = self.vertices.items.len;
-                    try self.pushFillPath(p.path.commands, p.color);
-                    if (self.vertices.items.len > start) try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .stroke_path => |p| {
-                    const shape_start = self.vertices.items.len;
-                    const start = self.line_vertices.items.len;
-                    try self.pushStrokePath(p.path.commands, p.style, p.color);
-                    if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, current_clip, .shape, null, null);
-                    if (self.line_vertices.items.len > start) try self.recordBatch(start, current_clip, .line_aa, null, null);
-                },
-                .rect => |r| {
-                    const start = self.vertices.items.len;
-                    try self.pushRect(r.rect, r.color);
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .rounded_rect => |r| {
-                    const start = self.vertices.items.len;
-                    try self.pushRoundedRect(r.rect, r.radius, r.color);
-                    if (self.vertices.items.len > start) try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .stroke_rounded_rect => |r| {
-                    const shape_start = self.vertices.items.len;
-                    const start = self.line_vertices.items.len;
-                    try self.pushStrokeRoundedRect(r.rect, r.radius, r.thickness, r.color);
-                    if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, current_clip, .shape, null, null);
-                    if (self.line_vertices.items.len > start) try self.recordBatch(start, current_clip, .line_aa, null, null);
-                },
-                .paint_quad => |q| {
-                    const start = self.paint_quad_vertices.items.len;
-                    try self.pushPaintQuad(q);
-                    if (self.paint_quad_vertices.items.len > start) try self.recordBatch(start, current_clip, .paint_quad, null, null);
-                },
-                .triangle => |t| {
-                    const start = self.vertices.items.len;
-                    try self.pushTriangle(
-                        .{ .pos = t.points[0], .color = t.color },
-                        .{ .pos = t.points[1], .color = t.color },
-                        .{ .pos = t.points[2], .color = t.color },
-                    );
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .linear_gradient_rect => |g| {
-                    const start = self.vertices.items.len;
-                    try self.pushLinearGradientRect(g);
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .radial_gradient_rect => |g| {
-                    const start = self.vertices.items.len;
-                    try self.pushRadialGradientRect(g);
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .sweep_gradient_rect => |g| {
-                    const start = self.vertices.items.len;
-                    try self.pushSweepGradientRect(g);
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .ellipse => |e| {
-                    const start = self.vertices.items.len;
-                    try self.pushEllipse(e.center, e.radius, e.color);
-                    if (self.vertices.items.len > start) try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .stroke_ellipse => |e| {
-                    const shape_start = self.vertices.items.len;
-                    const start = self.line_vertices.items.len;
-                    try self.pushStrokeEllipse(e.center, e.radius, e.thickness, e.color);
-                    if (self.vertices.items.len > shape_start) try self.recordBatch(shape_start, current_clip, .shape, null, null);
-                    if (self.line_vertices.items.len > start) try self.recordBatch(start, current_clip, .line_aa, null, null);
-                },
-                .line => |l| try self.pushBatchedLine(l.a, l.b, l.thickness, l.color, current_clip),
-                .styled_line => |l| try self.pushBatchedStyledLine(l.a, l.b, l.style, l.color, current_clip),
-                .point => |p| {
-                    const start = self.vertices.items.len;
-                    try self.pushPoint(p.pos, p.size, p.color);
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .polyline => |pl| try self.pushBatchedPolyline(pl.points, .{ .width = pl.thickness }, pl.color, current_clip),
-                .styled_polyline => |pl| try self.pushBatchedPolyline(pl.points, pl.style, pl.color, current_clip),
-                .bars => |b| {
-                    const start = self.vertices.items.len;
-                    if (b.values.len == 0) continue;
-                    const start_x = b.origin[0] + b.bar_width * 0.5;
-                    for (b.values, 0..) |val, i| {
-                        const x = start_x + @as(f32, @floatFromInt(i)) * b.bar_width;
-                        try self.pushRect(.{ .x = x, .y = b.origin[1] + b.base, .w = b.bar_width * 0.9, .h = val }, b.color);
-                    }
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .scatter => |s| {
-                    const start = self.vertices.items.len;
-                    for (s.points) |p| try self.pushCircle(p, s.size * 0.5, s.color);
-                    try self.recordBatch(start, current_clip, .shape, null, null);
-                },
-                .image => |i| {
-                    const start = self.text_vertices.items.len;
-                    try self.pushImage(i.image_id, i.rect, i.tint);
-                    if (self.text_vertices.items.len > start) try self.recordBatch(start, current_clip, .image, null, i.image_id);
-                },
-                .text => |t| try self.pushText(t, current_clip, text_provider),
-            }
-        }
+        var sink = ImmediateSceneSink{ .scene = self, .text_provider = text_provider };
+        try window_lower.lowerDrawList(ImmediateSceneSink, &sink, self.allocator, cmds);
     }
 
     pub fn pushTriangle(self: *ImmediateScene, a: window.Vertex, b: window.Vertex, c: window.Vertex) !void {
@@ -1334,6 +1299,10 @@ pub const ImmediateScene = struct {
     }
 
     pub fn pushLinearGradientRect(self: *ImmediateScene, gradient: window.LinearGradientRect) !void {
+        if (gradient.radius > 0.0) {
+            try self.pushRoundedGradientRect(gradient.rect, gradient.radius, linearGradientColorAt, gradient);
+            return;
+        }
         const x0 = gradient.rect.x;
         const y0 = gradient.rect.y;
         const x1 = gradient.rect.x + gradient.rect.w;
@@ -1343,6 +1312,10 @@ pub const ImmediateScene = struct {
     }
 
     pub fn pushRadialGradientRect(self: *ImmediateScene, gradient: window.RadialGradientRect) !void {
+        if (gradient.radius_px > 0.0) {
+            try self.pushRoundedGradientRect(gradient.rect, gradient.radius_px, radialGradientColorAt, gradient);
+            return;
+        }
         const x0 = gradient.rect.x;
         const y0 = gradient.rect.y;
         const x1 = gradient.rect.x + gradient.rect.w;
@@ -1352,12 +1325,50 @@ pub const ImmediateScene = struct {
     }
 
     pub fn pushSweepGradientRect(self: *ImmediateScene, gradient: window.SweepGradientRect) !void {
+        if (gradient.radius > 0.0) {
+            try self.pushRoundedGradientRect(gradient.rect, gradient.radius, sweepGradientColorAt, gradient);
+            return;
+        }
         const x0 = gradient.rect.x;
         const y0 = gradient.rect.y;
         const x1 = gradient.rect.x + gradient.rect.w;
         const y1 = gradient.rect.y + gradient.rect.h;
         try self.pushTriangle(.{ .pos = .{ x0, y0 }, .color = sweepGradientColorAt(gradient, .{ x0, y0 }) }, .{ .pos = .{ x1, y0 }, .color = sweepGradientColorAt(gradient, .{ x1, y0 }) }, .{ .pos = .{ x1, y1 }, .color = sweepGradientColorAt(gradient, .{ x1, y1 }) });
         try self.pushTriangle(.{ .pos = .{ x0, y0 }, .color = sweepGradientColorAt(gradient, .{ x0, y0 }) }, .{ .pos = .{ x1, y1 }, .color = sweepGradientColorAt(gradient, .{ x1, y1 }) }, .{ .pos = .{ x0, y1 }, .color = sweepGradientColorAt(gradient, .{ x0, y1 }) });
+    }
+
+    fn pushRoundedGradientRect(self: *ImmediateScene, rect: window.Rect, radius: f32, comptime colorAt: anytype, gradient: anytype) !void {
+        const r = roundedRectRadius(rect, radius);
+        if (r <= 0.0) {
+            const x0 = rect.x;
+            const y0 = rect.y;
+            const x1 = rect.x + rect.w;
+            const y1 = rect.y + rect.h;
+            try self.pushTriangle(.{ .pos = .{ x0, y0 }, .color = colorAt(gradient, .{ x0, y0 }) }, .{ .pos = .{ x1, y0 }, .color = colorAt(gradient, .{ x1, y0 }) }, .{ .pos = .{ x1, y1 }, .color = colorAt(gradient, .{ x1, y1 }) });
+            try self.pushTriangle(.{ .pos = .{ x0, y0 }, .color = colorAt(gradient, .{ x0, y0 }) }, .{ .pos = .{ x1, y1 }, .color = colorAt(gradient, .{ x1, y1 }) }, .{ .pos = .{ x0, y1 }, .color = colorAt(gradient, .{ x0, y1 }) });
+            return;
+        }
+        const segments = roundedRectCornerSegments(r);
+        const vertex_count = 1 + (segments + 1) * 4;
+        if (self.vertices.items.len + vertex_count * 3 > self.max_vertices) return error.VertexBufferOverflow;
+
+        const center = [2]f32{ rect.x + rect.w * 0.5, rect.y + rect.h * 0.5 };
+        const center_vertex = window.Vertex{ .pos = center, .color = colorAt(gradient, center) };
+        var prev = roundedRectPoint(rect, r, 0.0);
+        var corner: usize = 0;
+        while (corner < 4) : (corner += 1) {
+            var i: usize = 0;
+            while (i <= segments) : (i += 1) {
+                if (corner == 0 and i == 0) continue;
+                const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(segments));
+                const angle = @as(f32, @floatFromInt(corner)) * (std.math.pi * 0.5) + t * (std.math.pi * 0.5);
+                const next = roundedRectPoint(rect, r, angle);
+                try self.pushTriangle(center_vertex, .{ .pos = prev, .color = colorAt(gradient, prev) }, .{ .pos = next, .color = colorAt(gradient, next) });
+                prev = next;
+            }
+        }
+        const first = roundedRectPoint(rect, r, 0.0);
+        try self.pushTriangle(center_vertex, .{ .pos = prev, .color = colorAt(gradient, prev) }, .{ .pos = first, .color = colorAt(gradient, first) });
     }
 
     pub fn pushEllipse(self: *ImmediateScene, center: [2]f32, radius: [2]f32, color: [4]f32) !void {
@@ -1393,15 +1404,78 @@ pub const ImmediateScene = struct {
     }
 
     pub fn pushFillPath(self: *ImmediateScene, commands: []const window.PathCommand, color: [4]f32) !void {
-        var points = try std.ArrayList([2]f32).initCapacity(self.allocator, commands.len * 4 + 8);
-        defer points.deinit(self.allocator);
-        try flattenPath(self.allocator, commands, &points);
-        if (points.items.len < 3) return;
-        if (self.vertices.items.len + (points.items.len - 2) * 3 > self.max_vertices) return error.VertexBufferOverflow;
-        const anchor = window.Vertex{ .pos = points.items[0], .color = color };
+        var subpaths = try flattenPathSubpaths(self.allocator, commands);
+        defer {
+            for (subpaths.items) |*subpath| subpath.deinit(self.allocator);
+            subpaths.deinit(self.allocator);
+        }
+        for (subpaths.items) |subpath| {
+            if (subpath.items.len < 3) continue;
+            try self.pushTriangulatedPolygon(subpath.items, color);
+        }
+    }
+
+    fn pushTriangulatedPolygon(self: *ImmediateScene, raw_points: []const [2]f32, color: [4]f32) !void {
+        const points = trimClosedDuplicate(raw_points);
+        if (points.len < 3) return;
+        if (self.vertices.items.len + (points.len - 2) * 3 > self.max_vertices) return error.VertexBufferOverflow;
+        if (points.len == 3) {
+            try self.pushTriangle(.{ .pos = points[0], .color = color }, .{ .pos = points[1], .color = color }, .{ .pos = points[2], .color = color });
+            return;
+        }
+
+        var indices = try std.ArrayList(usize).initCapacity(self.allocator, points.len);
+        defer indices.deinit(self.allocator);
+        if (polygonSignedArea(points) >= 0.0) {
+            for (points, 0..) |_, i| try indices.append(self.allocator, i);
+        } else {
+            var i = points.len;
+            while (i > 0) {
+                i -= 1;
+                try indices.append(self.allocator, i);
+            }
+        }
+
+        var guard: usize = 0;
+        while (indices.items.len > 3 and guard < points.len * points.len) : (guard += 1) {
+            var clipped = false;
+            var i: usize = 0;
+            while (i < indices.items.len) : (i += 1) {
+                const prev_i = if (i == 0) indices.items.len - 1 else i - 1;
+                const next_i = if (i + 1 == indices.items.len) 0 else i + 1;
+                const a_index = indices.items[prev_i];
+                const b_index = indices.items[i];
+                const c_index = indices.items[next_i];
+                const a = points[a_index];
+                const b = points[b_index];
+                const c = points[c_index];
+                if (!isConvexEar(a, b, c)) continue;
+                if (triangleContainsAnyPoint(points, indices.items, a_index, b_index, c_index, a, b, c)) continue;
+                try self.pushTriangle(.{ .pos = a, .color = color }, .{ .pos = b, .color = color }, .{ .pos = c, .color = color });
+                _ = indices.orderedRemove(i);
+                clipped = true;
+                break;
+            }
+            if (!clipped) break;
+        }
+
+        if (indices.items.len == 3) {
+            try self.pushTriangle(
+                .{ .pos = points[indices.items[0]], .color = color },
+                .{ .pos = points[indices.items[1]], .color = color },
+                .{ .pos = points[indices.items[2]], .color = color },
+            );
+        } else {
+            try self.pushTriangleFan(points, color);
+        }
+    }
+
+    fn pushTriangleFan(self: *ImmediateScene, points: []const [2]f32, color: [4]f32) !void {
+        if (points.len < 3) return;
+        const anchor = window.Vertex{ .pos = points[0], .color = color };
         var i: usize = 1;
-        while (i + 1 < points.items.len) : (i += 1) {
-            try self.pushTriangle(anchor, .{ .pos = points.items[i], .color = color }, .{ .pos = points.items[i + 1], .color = color });
+        while (i + 1 < points.len) : (i += 1) {
+            try self.pushTriangle(anchor, .{ .pos = points[i], .color = color }, .{ .pos = points[i + 1], .color = color });
         }
     }
 
@@ -1844,6 +1918,135 @@ pub const ImmediateScene = struct {
     }
 };
 
+const ImmediateSceneSink = struct {
+    scene: *ImmediateScene,
+    text_provider: TextProvider,
+
+    pub fn fillPath(self: *ImmediateSceneSink, p: window.FillPath, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushFillPath(p.path.commands, p.color);
+        if (self.scene.vertices.items.len > start) try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn strokePath(self: *ImmediateSceneSink, p: window.StrokePath, clip: ?window.Rect) !void {
+        const shape_start = self.scene.vertices.items.len;
+        const start = self.scene.line_vertices.items.len;
+        try self.scene.pushStrokePath(p.path.commands, p.style, p.color);
+        if (self.scene.vertices.items.len > shape_start) try self.scene.recordBatch(shape_start, clip, .shape, null, null);
+        if (self.scene.line_vertices.items.len > start) try self.scene.recordBatch(start, clip, .line_aa, null, null);
+    }
+
+    pub fn rect(self: *ImmediateSceneSink, r: anytype, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushRect(r.rect, r.color);
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn roundedRect(self: *ImmediateSceneSink, r: window.RoundedRect, clip: ?window.Rect) !void {
+        const start = self.scene.paint_quad_vertices.items.len;
+        try self.scene.pushPaintQuad(.{ .rect = r.rect, .radius = r.radius, .background = r.color, .border_width = 0.0, .border_color = .{ 0.0, 0.0, 0.0, 0.0 }, .layer = r.layer });
+        if (self.scene.paint_quad_vertices.items.len > start) try self.scene.recordBatch(start, clip, .paint_quad, null, null);
+    }
+
+    pub fn strokeRoundedRect(self: *ImmediateSceneSink, r: window.StrokeRoundedRect, clip: ?window.Rect) !void {
+        const start = self.scene.paint_quad_vertices.items.len;
+        try self.scene.pushPaintQuad(.{ .rect = r.rect, .radius = r.radius, .background = .{ 0.0, 0.0, 0.0, 0.0 }, .border_width = r.thickness, .border_color = r.color, .layer = r.layer });
+        if (self.scene.paint_quad_vertices.items.len > start) try self.scene.recordBatch(start, clip, .paint_quad, null, null);
+    }
+
+    pub fn paintQuad(self: *ImmediateSceneSink, q: window.PaintQuad, clip: ?window.Rect) !void {
+        const start = self.scene.paint_quad_vertices.items.len;
+        try self.scene.pushPaintQuad(q);
+        if (self.scene.paint_quad_vertices.items.len > start) try self.scene.recordBatch(start, clip, .paint_quad, null, null);
+    }
+
+    pub fn triangle(self: *ImmediateSceneSink, t: window.Triangle, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushTriangle(.{ .pos = t.points[0], .color = t.color }, .{ .pos = t.points[1], .color = t.color }, .{ .pos = t.points[2], .color = t.color });
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn linearGradientRect(self: *ImmediateSceneSink, g: window.LinearGradientRect, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushLinearGradientRect(g);
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn radialGradientRect(self: *ImmediateSceneSink, g: window.RadialGradientRect, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushRadialGradientRect(g);
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn sweepGradientRect(self: *ImmediateSceneSink, g: window.SweepGradientRect, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushSweepGradientRect(g);
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn ellipse(self: *ImmediateSceneSink, e: window.Ellipse, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushEllipse(e.center, e.radius, e.color);
+        if (self.scene.vertices.items.len > start) try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn strokeEllipse(self: *ImmediateSceneSink, e: window.StrokeEllipse, clip: ?window.Rect) !void {
+        const shape_start = self.scene.vertices.items.len;
+        const start = self.scene.line_vertices.items.len;
+        try self.scene.pushStrokeEllipse(e.center, e.radius, e.thickness, e.color);
+        if (self.scene.vertices.items.len > shape_start) try self.scene.recordBatch(shape_start, clip, .shape, null, null);
+        if (self.scene.line_vertices.items.len > start) try self.scene.recordBatch(start, clip, .line_aa, null, null);
+    }
+
+    pub fn line(self: *ImmediateSceneSink, l: anytype, clip: ?window.Rect) !void {
+        try self.scene.pushBatchedLine(l.a, l.b, l.thickness, l.color, clip);
+    }
+
+    pub fn styledLine(self: *ImmediateSceneSink, l: window.StyledLine, clip: ?window.Rect) !void {
+        try self.scene.pushBatchedStyledLine(l.a, l.b, l.style, l.color, clip);
+    }
+
+    pub fn point(self: *ImmediateSceneSink, p: anytype, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        try self.scene.pushPoint(p.pos, p.size, p.color);
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn polyline(self: *ImmediateSceneSink, p: anytype, clip: ?window.Rect) !void {
+        try self.scene.pushBatchedPolyline(p.points, .{ .width = p.thickness }, p.color, clip);
+    }
+
+    pub fn styledPolyline(self: *ImmediateSceneSink, p: window.StyledPolyline, clip: ?window.Rect) !void {
+        try self.scene.pushBatchedPolyline(p.points, p.style, p.color, clip);
+    }
+
+    pub fn bars(self: *ImmediateSceneSink, b: anytype, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        if (b.values.len == 0) return;
+        for (b.values, 0..) |val, i| {
+            const x = b.origin[0] + @as(f32, @floatFromInt(i)) * b.bar_width;
+            try self.scene.pushRect(.{ .x = x, .y = b.origin[1] + b.base, .w = b.bar_width, .h = val }, b.color);
+        }
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn scatter(self: *ImmediateSceneSink, s: anytype, clip: ?window.Rect) !void {
+        const start = self.scene.vertices.items.len;
+        for (s.points) |p| try self.scene.pushCircle(p, s.size * 0.5, s.color);
+        try self.scene.recordBatch(start, clip, .shape, null, null);
+    }
+
+    pub fn image(self: *ImmediateSceneSink, i: anytype, clip: ?window.Rect) !void {
+        const start = self.scene.text_vertices.items.len;
+        try self.scene.pushImage(i.image_id, i.rect, i.tint);
+        if (self.scene.text_vertices.items.len > start) try self.scene.recordBatch(start, clip, .image, null, i.image_id);
+    }
+
+    pub fn text(self: *ImmediateSceneSink, t: anytype, clip: ?window.Rect) !void {
+        try self.scene.pushText(t, clip, self.text_provider);
+    }
+};
+
 pub const GpuImmediateRenderer = struct {
     vertex_buffer: backend.BufferHandle,
     paint_quad_vertex_buffer: backend.BufferHandle,
@@ -1970,6 +2173,7 @@ pub const GpuImmediateRenderer = struct {
 
     pub fn beginFrame(self: *GpuImmediateRenderer, gctx: *backend.RenderContext, logical_size: [2]u32) bool {
         if (!gctx.canRender()) return false;
+        _ = backend.syncSwapchainToWindow(gctx);
         const screen_size = [2]f32{ @floatFromInt(logical_size[0]), @floatFromInt(logical_size[1]) };
         const ubuf = gctx.lookupResource(self.uniform_buffer) orelse return false;
         gctx.queue.writeBuffer(ubuf, 0, f32, screen_size[0..]);
@@ -2120,6 +2324,7 @@ pub fn createTextureResource(
     height: u32,
     kind: TextureKind,
 ) TextureResource {
+    if (!backend.compiled_with_zgpu) @compileError("createTextureResource requires -Denable-zgpu-backend=true");
     const texture = gctx.createTexture(.{
         .usage = .{ .texture_binding = true, .copy_dst = true },
         .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
@@ -2154,6 +2359,7 @@ pub fn createTextureResource(
 }
 
 pub fn destroyTextureResource(gctx: *backend.RenderContext, texture: *TextureResource) void {
+    if (!backend.compiled_with_zgpu) @compileError("destroyTextureResource requires -Denable-zgpu-backend=true");
     gctx.releaseResource(texture.bind_group);
     gctx.releaseResource(texture.sampler);
     gctx.releaseResource(texture.view);
@@ -2161,6 +2367,7 @@ pub fn destroyTextureResource(gctx: *backend.RenderContext, texture: *TextureRes
 }
 
 pub fn uploadRgbaPixels(allocator: std.mem.Allocator, gctx: *backend.RenderContext, texture_resource: TextureResource, rgba_pixels: []const u8) !void {
+    if (!backend.compiled_with_zgpu) @compileError("uploadRgbaPixels requires -Denable-zgpu-backend=true");
     const src_stride = texture_resource.width * 4;
     const dst_stride = alignUpU32(src_stride, 256);
     const upload_pixels = if (dst_stride == src_stride)
@@ -2183,6 +2390,7 @@ pub fn uploadAlphaAtlas(
     width: u32,
     height: u32,
 ) void {
+    if (!backend.compiled_with_zgpu) @compileError("uploadAlphaAtlas requires -Denable-zgpu-backend=true");
     uploadTextureBytes(gctx, texture_resource, atlas_pixels, atlas_width, atlas_height, x, y, width, height);
 }
 
@@ -2197,6 +2405,7 @@ fn uploadTextureBytes(
     width: u32,
     height: u32,
 ) void {
+    if (!backend.compiled_with_zgpu) @compileError("uploadTextureBytes requires -Denable-zgpu-backend=true");
     const texture = gctx.lookupResource(texture_resource.texture).?;
     const copy = wgpu.ImageCopyTexture{
         .texture = texture,
@@ -2581,6 +2790,22 @@ fn clipEqual(a: ?window.Rect, b: ?window.Rect) bool {
     return a.?.x == b.?.x and a.?.y == b.?.y and a.?.w == b.?.w and a.?.h == b.?.h;
 }
 
+fn currentClip(stack: []const window.Rect) ?window.Rect {
+    if (stack.len == 0) return null;
+    return stack[stack.len - 1];
+}
+
+fn effectiveClip(current: ?window.Rect, next: window.Rect) window.Rect {
+    if (current) |clip| {
+        const x0 = @max(clip.x, next.x);
+        const y0 = @max(clip.y, next.y);
+        const x1 = @min(clip.x + clip.w, next.x + next.w);
+        const y1 = @min(clip.y + clip.h, next.y + next.h);
+        return .{ .x = x0, .y = y0, .w = @max(0.0, x1 - x0), .h = @max(0.0, y1 - y0) };
+    }
+    return next;
+}
+
 fn emptyDefaultFont(_: *anyopaque) ?window.TextFontId {
     return null;
 }
@@ -2745,12 +2970,304 @@ fn flattenPath(allocator: std.mem.Allocator, commands: []const window.PathComman
     }
 }
 
+fn flattenPathSubpaths(allocator: std.mem.Allocator, commands: []const window.PathCommand) !std.ArrayList(std.ArrayList([2]f32)) {
+    var subpaths: std.ArrayList(std.ArrayList([2]f32)) = .empty;
+    errdefer {
+        for (subpaths.items) |*subpath| subpath.deinit(allocator);
+        subpaths.deinit(allocator);
+    }
+    var current_path = try std.ArrayList([2]f32).initCapacity(allocator, commands.len + 4);
+    errdefer current_path.deinit(allocator);
+    var current: ?[2]f32 = null;
+    var start: ?[2]f32 = null;
+    for (commands) |command| {
+        switch (command) {
+            .move_to => |p| {
+                if (current_path.items.len >= 3) {
+                    try subpaths.append(allocator, current_path);
+                    current_path = try std.ArrayList([2]f32).initCapacity(allocator, commands.len + 4);
+                } else {
+                    current_path.clearRetainingCapacity();
+                }
+                try appendPathPoint(allocator, &current_path, p);
+                current = p;
+                start = p;
+            },
+            .line_to => |p| {
+                try appendPathPoint(allocator, &current_path, p);
+                current = p;
+            },
+            .quad_to => |q| {
+                const p0 = current orelse q.end;
+                var i: usize = 1;
+                while (i <= 12) : (i += 1) {
+                    const t = @as(f32, @floatFromInt(i)) / 12.0;
+                    try appendPathPoint(allocator, &current_path, quadPathPoint(p0, q.control, q.end, t));
+                }
+                current = q.end;
+            },
+            .cubic_to => |c| {
+                const p0 = current orelse c.end;
+                var i: usize = 1;
+                while (i <= 16) : (i += 1) {
+                    const t = @as(f32, @floatFromInt(i)) / 16.0;
+                    try appendPathPoint(allocator, &current_path, cubicPathPoint(p0, c.c0, c.c1, c.end, t));
+                }
+                current = c.end;
+            },
+            .arc => |a| {
+                try flattenArc(allocator, &current_path, current, a.center, a.radius, a.start_angle, a.end_angle, false);
+                current = .{ a.center[0] + std.math.cos(a.end_angle) * a.radius, a.center[1] + std.math.sin(a.end_angle) * a.radius };
+            },
+            .arc_negative => |a| {
+                try flattenArc(allocator, &current_path, current, a.center, a.radius, a.start_angle, a.end_angle, true);
+                current = .{ a.center[0] + std.math.cos(a.end_angle) * a.radius, a.center[1] + std.math.sin(a.end_angle) * a.radius };
+            },
+            .close => {
+                if (start) |p| {
+                    try appendPathPoint(allocator, &current_path, p);
+                    current = p;
+                }
+                if (current_path.items.len >= 3) {
+                    try subpaths.append(allocator, current_path);
+                    current_path = try std.ArrayList([2]f32).initCapacity(allocator, commands.len + 4);
+                } else {
+                    current_path.clearRetainingCapacity();
+                }
+                current = null;
+                start = null;
+            },
+        }
+    }
+    if (current_path.items.len >= 3) {
+        try subpaths.append(allocator, current_path);
+    } else {
+        current_path.deinit(allocator);
+    }
+    return subpaths;
+}
+
 fn appendPathPoint(allocator: std.mem.Allocator, out: *std.ArrayList([2]f32), p: [2]f32) !void {
     if (out.items.len > 0) {
         const last = out.items[out.items.len - 1];
         if (@abs(last[0] - p[0]) < 0.001 and @abs(last[1] - p[1]) < 0.001) return;
     }
     try out.append(allocator, p);
+}
+
+fn trimClosedDuplicate(points: []const [2]f32) []const [2]f32 {
+    if (points.len < 2) return points;
+    const first = points[0];
+    const last = points[points.len - 1];
+    if (@abs(first[0] - last[0]) < 0.001 and @abs(first[1] - last[1]) < 0.001) return points[0 .. points.len - 1];
+    return points;
+}
+
+fn polygonSignedArea(points: []const [2]f32) f32 {
+    var area: f32 = 0.0;
+    for (points, 0..) |p, i| {
+        const q = points[(i + 1) % points.len];
+        area += p[0] * q[1] - q[0] * p[1];
+    }
+    return area * 0.5;
+}
+
+fn isConvexEar(a: [2]f32, b: [2]f32, c: [2]f32) bool {
+    return cross2(a, b, c) > 0.000001;
+}
+
+fn triangleContainsAnyPoint(points: []const [2]f32, indices: []const usize, a_index: usize, b_index: usize, c_index: usize, a: [2]f32, b: [2]f32, c: [2]f32) bool {
+    for (indices) |index| {
+        if (index == a_index or index == b_index or index == c_index) continue;
+        if (pointInTriangle(points[index], a, b, c)) return true;
+    }
+    return false;
+}
+
+fn pointInTriangle(p: [2]f32, a: [2]f32, b: [2]f32, c: [2]f32) bool {
+    const ab = cross2(a, b, p);
+    const bc = cross2(b, c, p);
+    const ca = cross2(c, a, p);
+    return ab >= -0.000001 and bc >= -0.000001 and ca >= -0.000001;
+}
+
+fn cross2(a: [2]f32, b: [2]f32, c: [2]f32) f32 {
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+fn trianglesContainPoint(vertices: []const window.Vertex, p: [2]f32) bool {
+    var i: usize = 0;
+    while (i + 2 < vertices.len) : (i += 3) {
+        if (pointInTriangleAnyWinding(p, vertices[i].pos, vertices[i + 1].pos, vertices[i + 2].pos)) return true;
+    }
+    return false;
+}
+
+fn pointInTriangleAnyWinding(p: [2]f32, a: [2]f32, b: [2]f32, c: [2]f32) bool {
+    const ab = cross2(a, b, p);
+    const bc = cross2(b, c, p);
+    const ca = cross2(c, a, p);
+    return (ab >= -0.000001 and bc >= -0.000001 and ca >= -0.000001) or
+        (ab <= 0.000001 and bc <= 0.000001 and ca <= 0.000001);
+}
+
+fn rasterizeShapeBatchesForTest(target: *Image, vertices: []const window.Vertex, batches: []const Batch) void {
+    for (batches) |batch| {
+        if (batch.kind != .shape) continue;
+        const clip = batch.clip orelse .{ .x = 0, .y = 0, .w = @as(f32, @floatFromInt(target.width)), .h = @as(f32, @floatFromInt(target.height)) };
+        var i: usize = batch.first;
+        const end = batch.first + batch.count;
+        while (i + 2 < end) : (i += 3) {
+            rasterizeTriangleForTest(target, vertices[i], vertices[i + 1], vertices[i + 2], clip);
+        }
+    }
+}
+
+fn rasterizePaintQuadBatchesForTest(target: *Image, vertices: []const window.PaintQuadVertex, batches: []const Batch) void {
+    for (batches) |batch| {
+        if (batch.kind != .paint_quad) continue;
+        const clip = batch.clip orelse .{ .x = 0, .y = 0, .w = @as(f32, @floatFromInt(target.width)), .h = @as(f32, @floatFromInt(target.height)) };
+        var i: usize = batch.first;
+        const end = batch.first + batch.count;
+        while (i + 2 < end) : (i += 3) {
+            rasterizePaintQuadTriangleForTest(target, vertices[i], vertices[i + 1], vertices[i + 2], clip);
+        }
+    }
+}
+
+fn expectGpuLoweringMatchesCpuPixels(draw_list: []const window.DrawCmd, width: u32, height: u32) !void {
+    var cpu_scene = scene2d.Scene2D.init(std.testing.allocator);
+    defer cpu_scene.deinit();
+    var cpu_renderer = cpu.CpuRenderer.init(std.testing.allocator);
+    var cpu_image = try Image.init(std.testing.allocator, width, height, .transparent);
+    defer cpu_image.deinit();
+    try window_draw.renderDrawListCpu(draw_list, &cpu_scene, &cpu_renderer, &cpu_image, null, null, 1.0);
+
+    var gpu_scene = try ImmediateScene.init(std.testing.allocator, 512, 64, 16, 64);
+    defer gpu_scene.deinit();
+    try gpu_scene.beginFrame(&.{});
+    try gpu_scene.pushDrawList(draw_list, emptyTextProvider());
+    var lowered_image = try Image.init(std.testing.allocator, width, height, .transparent);
+    defer lowered_image.deinit();
+    rasterizeShapeBatchesForTest(&lowered_image, gpu_scene.vertices.items, gpu_scene.batches.items);
+    rasterizePaintQuadBatchesForTest(&lowered_image, gpu_scene.paint_quad_vertices.items, gpu_scene.batches.items);
+
+    const comparison = try cpu_image.compare(&lowered_image, 0);
+    try std.testing.expectEqual(@as(usize, 0), comparison.mismatched_pixels);
+}
+
+fn rasterizeTriangleForTest(target: *Image, a: window.Vertex, b: window.Vertex, c: window.Vertex, clip: window.Rect) void {
+    const min_x = @min(@min(a.pos[0], b.pos[0]), c.pos[0]);
+    const min_y = @min(@min(a.pos[1], b.pos[1]), c.pos[1]);
+    const max_x = @max(@max(a.pos[0], b.pos[0]), c.pos[0]);
+    const max_y = @max(@max(a.pos[1], b.pos[1]), c.pos[1]);
+    const x0: i32 = @intFromFloat(@floor(@max(min_x, clip.x)));
+    const y0: i32 = @intFromFloat(@floor(@max(min_y, clip.y)));
+    const x1: i32 = @intFromFloat(@ceil(@min(max_x, clip.x + clip.w)));
+    const y1: i32 = @intFromFloat(@ceil(@min(max_y, clip.y + clip.h)));
+    var y = @max(0, y0);
+    while (y < @min(y1, @as(i32, @intCast(target.height)))) : (y += 1) {
+        var x = @max(0, x0);
+        while (x < @min(x1, @as(i32, @intCast(target.width)))) : (x += 1) {
+            const p = [2]f32{ @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5 };
+            if (pointInTriangleAnyWinding(p, a.pos, b.pos, c.pos)) {
+                target.blendPixel(@intCast(x), @intCast(y), vertexColor(a.color));
+            }
+        }
+    }
+}
+
+fn rasterizePaintQuadTriangleForTest(target: *Image, a: window.PaintQuadVertex, b: window.PaintQuadVertex, c: window.PaintQuadVertex, clip: window.Rect) void {
+    const min_x = @min(@min(a.pos[0], b.pos[0]), c.pos[0]);
+    const min_y = @min(@min(a.pos[1], b.pos[1]), c.pos[1]);
+    const max_x = @max(@max(a.pos[0], b.pos[0]), c.pos[0]);
+    const max_y = @max(@max(a.pos[1], b.pos[1]), c.pos[1]);
+    const x0: i32 = @intFromFloat(@floor(@max(min_x - 1.0, clip.x)));
+    const y0: i32 = @intFromFloat(@floor(@max(min_y - 1.0, clip.y)));
+    const x1: i32 = @intFromFloat(@ceil(@min(max_x + 1.0, clip.x + clip.w)));
+    const y1: i32 = @intFromFloat(@ceil(@min(max_y + 1.0, clip.y + clip.h)));
+    var y = @max(0, y0);
+    while (y < @min(y1, @as(i32, @intCast(target.height)))) : (y += 1) {
+        var x = @max(0, x0);
+        while (x < @min(x1, @as(i32, @intCast(target.width)))) : (x += 1) {
+            const p = [2]f32{ @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5 };
+            if (!pointInTriangleAnyWinding(p, a.pos, b.pos, c.pos)) continue;
+            const color = paintQuadColorForTest(a, p) orelse continue;
+            target.blendPixel(@intCast(x), @intCast(y), color);
+        }
+    }
+}
+
+fn paintQuadColorForTest(v: window.PaintQuadVertex, p: [2]f32) ?Color {
+    const rect = window.Rect{ .x = v.rect_origin[0], .y = v.rect_origin[1], .w = v.rect_size[0], .h = v.rect_size[1] };
+    const d = paintQuadRoundedRectSdf(p[0], p[1], rect, v.radius);
+    const aa: f32 = 0.75;
+    const outer_alpha = 1.0 - paintQuadSmoothstep(-aa, aa, d);
+    if (outer_alpha <= 0.0) return null;
+    var color = vertexColor(v.background);
+    const border = vertexColor(v.border_color);
+    if (v.border_width > 0.0 and border.a > 0) {
+        const inner_sdf = -(d + v.border_width);
+        const border_sdf = @max(inner_sdf, d);
+        if (border_sdf < aa) {
+            const blended = blendPaintQuadBorderOverBackground(border, color);
+            color = mixPaintQuadColor(color, blended, 1.0 - paintQuadSmoothstep(-aa, aa, inner_sdf));
+        }
+    }
+    return color.withAlphaScale(outer_alpha);
+}
+
+fn paintQuadRoundedRectSdf(px: f32, py: f32, rect: window.Rect, radius: f32) f32 {
+    const half_w = rect.w * 0.5;
+    const half_h = rect.h * 0.5;
+    const cx = rect.x + half_w;
+    const cy = rect.y + half_h;
+    const qx = @abs(px - cx) - (half_w - radius);
+    const qy = @abs(py - cy) - (half_h - radius);
+    const ox = @max(qx, 0.0);
+    const oy = @max(qy, 0.0);
+    return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0.0) - radius;
+}
+
+fn paintQuadSmoothstep(edge0: f32, edge1: f32, x: f32) f32 {
+    const t = std.math.clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn blendPaintQuadBorderOverBackground(border: Color, background: Color) Color {
+    const ba = @as(f32, @floatFromInt(border.a)) / 255.0;
+    const bga = @as(f32, @floatFromInt(background.a)) / 255.0;
+    const out_a = ba + bga * (1.0 - ba);
+    if (out_a <= 0.0001) return .transparent;
+    return Color.rgba(
+        @intFromFloat(@round(((@as(f32, @floatFromInt(border.r)) / 255.0 * ba + @as(f32, @floatFromInt(background.r)) / 255.0 * bga * (1.0 - ba)) / out_a) * 255.0)),
+        @intFromFloat(@round(((@as(f32, @floatFromInt(border.g)) / 255.0 * ba + @as(f32, @floatFromInt(background.g)) / 255.0 * bga * (1.0 - ba)) / out_a) * 255.0)),
+        @intFromFloat(@round(((@as(f32, @floatFromInt(border.b)) / 255.0 * ba + @as(f32, @floatFromInt(background.b)) / 255.0 * bga * (1.0 - ba)) / out_a) * 255.0)),
+        @intFromFloat(@round(out_a * 255.0)),
+    );
+}
+
+fn mixPaintQuadColor(a: Color, b: Color, t: f32) Color {
+    return Color.rgba(
+        mixPaintQuadByte(a.r, b.r, t),
+        mixPaintQuadByte(a.g, b.g, t),
+        mixPaintQuadByte(a.b, b.b, t),
+        mixPaintQuadByte(a.a, b.a, t),
+    );
+}
+
+fn mixPaintQuadByte(a: u8, b: u8, t: f32) u8 {
+    const value = @as(f32, @floatFromInt(a)) + (@as(f32, @floatFromInt(b)) - @as(f32, @floatFromInt(a))) * std.math.clamp(t, 0.0, 1.0);
+    return @intFromFloat(@round(std.math.clamp(value, 0.0, 255.0)));
+}
+
+fn vertexColor(color: [4]f32) Color {
+    return Color.rgba(
+        @intFromFloat(@round(std.math.clamp(color[0], 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[1], 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[2], 0.0, 1.0) * 255.0)),
+        @intFromFloat(@round(std.math.clamp(color[3], 0.0, 1.0) * 255.0)),
+    );
 }
 
 fn strokeQualityUsesFastSegments(quality: window.StrokeQuality) bool {
@@ -3088,6 +3605,251 @@ test "window gpu vector polylines use independent stroke mesh" {
     try std.testing.expectEqual(@as(usize, 0), scene.line_vertices.items.len);
     try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
     try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
+}
+
+test "window gpu bars match CPU draw-list geometry" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 128, 16, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    const values = [_]f32{ 4.0, 6.0 };
+    try scene.pushDrawList(&.{.{ .bars = .{
+        .values = &values,
+        .base = 2.0,
+        .bar_width = 5.0,
+        .origin = .{ 10.0, 20.0 },
+        .color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .layer = 0,
+    } }}, emptyTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 12), scene.vertices.items.len);
+    try std.testing.expectEqual([2]f32{ 10.0, 22.0 }, scene.vertices.items[0].pos);
+    try std.testing.expectEqual([2]f32{ 15.0, 26.0 }, scene.vertices.items[2].pos);
+    try std.testing.expectEqual([2]f32{ 15.0, 26.0 }, scene.vertices.items[4].pos);
+    try std.testing.expectEqual([2]f32{ 15.0, 22.0 }, scene.vertices.items[6].pos);
+    try std.testing.expectEqual([2]f32{ 20.0, 28.0 }, scene.vertices.items[8].pos);
+    try std.testing.expectEqual([2]f32{ 20.0, 28.0 }, scene.vertices.items[10].pos);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
+}
+
+test "window gpu nested clips use intersection stack" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 128, 16, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushDrawList(&.{
+        .{ .clip_begin = .{ .x = 0, .y = 0, .w = 10, .h = 10 } },
+        .{ .clip_begin = .{ .x = 4, .y = 2, .w = 8, .h = 5 } },
+        .{ .rect = .{ .rect = .{ .x = 0, .y = 0, .w = 12, .h = 12 }, .color = .{ 1, 0, 0, 1 }, .layer = 0 } },
+        .{ .clip_end = {} },
+        .{ .rect = .{ .rect = .{ .x = 0, .y = 0, .w = 12, .h = 12 }, .color = .{ 0, 1, 0, 1 }, .layer = 0 } },
+        .{ .clip_end = {} },
+    }, emptyTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 2), scene.batches.items.len);
+    try std.testing.expectEqual(window.Rect{ .x = 4, .y = 2, .w = 6, .h = 5 }, scene.batches.items[0].clip.?);
+    try std.testing.expectEqual(window.Rect{ .x = 0, .y = 0, .w = 10, .h = 10 }, scene.batches.items[1].clip.?);
+}
+
+test "window gpu lowering matches CPU pixels for nested clips and bars" {
+    const draw_list = [_]window.DrawCmd{
+        .{ .clip_begin = .{ .x = 0, .y = 0, .w = 10, .h = 10 } },
+        .{ .clip_begin = .{ .x = 4, .y = 2, .w = 8, .h = 5 } },
+        .{ .bars = .{
+            .values = &.{4},
+            .base = 0,
+            .bar_width = 10,
+            .origin = .{ 0, 0 },
+            .color = .{ 1, 0, 0, 1 },
+            .layer = 0,
+        } },
+        .{ .clip_end = {} },
+        .{ .bars = .{
+            .values = &.{10},
+            .base = 0,
+            .bar_width = 10,
+            .origin = .{ 0, 0 },
+            .color = .{ 0, 1, 0, 1 },
+            .layer = 0,
+        } },
+        .{ .clip_end = {} },
+    };
+
+    try expectGpuLoweringMatchesCpuPixels(&draw_list, 12, 12);
+}
+
+test "window gpu lowering matches CPU pixels for mixed filled shapes" {
+    const path = [_]window.PathCommand{
+        .{ .move_to = .{ 0, 6 } },
+        .{ .line_to = .{ 5, 6 } },
+        .{ .line_to = .{ 5, 11 } },
+        .{ .line_to = .{ 2, 8 } },
+        .{ .line_to = .{ 0, 11 } },
+        .close,
+    };
+    const draw_list = [_]window.DrawCmd{
+        .{ .rect = .{ .rect = .{ .x = 1, .y = 1, .w = 4, .h = 3 }, .color = .{ 1, 0, 0, 1 }, .layer = 0 } },
+        .{ .point = .{ .pos = .{ 8, 2 }, .size = 4, .color = .{ 0, 1, 0, 1 }, .layer = 0 } },
+        .{ .triangle = .{ .points = .{ .{ 10, 6 }, .{ 15, 6 }, .{ 10, 11 } }, .color = .{ 0, 0, 1, 1 }, .layer = 0 } },
+        .{ .fill_path = .{ .path = .{ .commands = &path }, .color = .{ 1, 1, 0, 1 }, .layer = 0 } },
+    };
+
+    try expectGpuLoweringMatchesCpuPixels(&draw_list, 16, 12);
+}
+
+test "window gpu lowering matches CPU pixels for paint quads" {
+    const draw_list = [_]window.DrawCmd{
+        .{ .rounded_rect = .{
+            .rect = .{ .x = 2, .y = 2, .w = 8, .h = 8 },
+            .radius = 3,
+            .color = .{ 1, 0, 0, 1 },
+            .layer = 0,
+        } },
+        .{ .stroke_rounded_rect = .{
+            .rect = .{ .x = 12, .y = 2, .w = 8, .h = 8 },
+            .radius = 3,
+            .thickness = 2,
+            .color = .{ 0, 1, 0, 1 },
+            .layer = 0,
+        } },
+        .{ .paint_quad = .{
+            .rect = .{ .x = 22, .y = 2, .w = 8, .h = 8 },
+            .radius = 3,
+            .background = .{ 0, 0, 1, 1 },
+            .border_width = 1.5,
+            .border_color = .{ 1, 1, 1, 0.75 },
+            .layer = 0,
+        } },
+    };
+
+    try expectGpuLoweringMatchesCpuPixels(&draw_list, 32, 12);
+}
+
+test "window gpu fill paths triangulate concave polygons" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 128, 16, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    const commands = [_]window.PathCommand{
+        .{ .move_to = .{ 0.0, 0.0 } },
+        .{ .line_to = .{ 10.0, 0.0 } },
+        .{ .line_to = .{ 10.0, 10.0 } },
+        .{ .line_to = .{ 5.0, 5.0 } },
+        .{ .line_to = .{ 0.0, 10.0 } },
+        .close,
+    };
+    try scene.pushDrawList(&.{.{ .fill_path = .{
+        .path = .{ .commands = &commands },
+        .color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .layer = 0,
+    } }}, emptyTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 9), scene.vertices.items.len);
+    try std.testing.expect(!trianglesContainPoint(scene.vertices.items, .{ 5.0, 7.5 }));
+    try std.testing.expect(trianglesContainPoint(scene.vertices.items, .{ 5.0, 2.0 }));
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
+}
+
+test "window gpu fill paths keep independent subpaths separate" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 128, 16, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    const commands = [_]window.PathCommand{
+        .{ .move_to = .{ 0.0, 0.0 } },
+        .{ .line_to = .{ 3.0, 0.0 } },
+        .{ .line_to = .{ 3.0, 3.0 } },
+        .{ .line_to = .{ 0.0, 3.0 } },
+        .close,
+        .{ .move_to = .{ 7.0, 0.0 } },
+        .{ .line_to = .{ 10.0, 0.0 } },
+        .{ .line_to = .{ 10.0, 3.0 } },
+        .{ .line_to = .{ 7.0, 3.0 } },
+        .close,
+    };
+    try scene.pushDrawList(&.{.{ .fill_path = .{
+        .path = .{ .commands = &commands },
+        .color = .{ 1.0, 0.0, 0.0, 1.0 },
+        .layer = 0,
+    } }}, emptyTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 12), scene.vertices.items.len);
+    try std.testing.expect(trianglesContainPoint(scene.vertices.items, .{ 1.5, 1.5 }));
+    try std.testing.expect(trianglesContainPoint(scene.vertices.items, .{ 8.5, 1.5 }));
+    try std.testing.expect(!trianglesContainPoint(scene.vertices.items, .{ 5.0, 1.5 }));
+}
+
+test "window gpu rounded gradient rects use clipped rounded geometry" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 2048, 16, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushDrawList(&.{
+        .{ .linear_gradient_rect = .{
+            .rect = .{ .x = 0, .y = 0, .w = 20, .h = 12 },
+            .radius = 4,
+            .start = .{ 0, 0 },
+            .end = .{ 20, 0 },
+            .start_color = .{ 1, 0, 0, 1 },
+            .end_color = .{ 0, 0, 1, 1 },
+            .layer = 0,
+        } },
+        .{ .radial_gradient_rect = .{
+            .rect = .{ .x = 24, .y = 0, .w = 20, .h = 12 },
+            .radius_px = 4,
+            .center = .{ 34, 6 },
+            .radius = 12,
+            .inner_color = .{ 1, 1, 1, 1 },
+            .outer_color = .{ 0, 0, 0, 1 },
+            .layer = 0,
+        } },
+        .{ .sweep_gradient_rect = .{
+            .rect = .{ .x = 48, .y = 0, .w = 20, .h = 12 },
+            .radius = 4,
+            .center = .{ 58, 6 },
+            .start_angle = 0,
+            .start_color = .{ 1, 0, 0, 1 },
+            .end_color = .{ 0, 1, 0, 1 },
+            .layer = 0,
+        } },
+    }, emptyTextProvider());
+
+    try std.testing.expect(scene.vertices.items.len > 18);
+    try std.testing.expectEqual(@as(usize, 0), scene.line_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.shape, scene.batches.items[0].kind);
+}
+
+test "window gpu rounded rect commands use paint-quad SDF path" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 64, 64, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushDrawList(&.{
+        .{ .rounded_rect = .{
+            .rect = .{ .x = 1, .y = 2, .w = 10, .h = 8 },
+            .radius = 3,
+            .color = .{ 1, 0, 0, 1 },
+            .layer = 0,
+        } },
+        .{ .stroke_rounded_rect = .{
+            .rect = .{ .x = 14, .y = 2, .w = 10, .h = 8 },
+            .radius = 3,
+            .thickness = 1.5,
+            .color = .{ 0, 1, 0, 1 },
+            .layer = 0,
+        } },
+    }, emptyTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 0), scene.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scene.line_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 12), scene.paint_quad_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.paint_quad, scene.batches.items[0].kind);
+    try std.testing.expectEqual(@as(f32, 3), scene.paint_quad_vertices.items[0].radius);
+    try std.testing.expectEqual(@as(f32, 1.5), scene.paint_quad_vertices.items[6].border_width);
 }
 
 test "window gpu dashed lines preserve gaps before batching" {

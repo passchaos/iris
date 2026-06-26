@@ -1,4 +1,5 @@
 pub const Backend = enum {
+    auto,
     gpu,
     cpu,
 };

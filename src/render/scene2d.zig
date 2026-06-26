@@ -2632,15 +2632,15 @@ fn appendImageRectStrips(
             if (!pointInRect(sample, fill.area.rect)) continue;
             const u = (sample.x - fill.area.rect.x) / fill.area.rect.w;
             const v = (sample.y - fill.area.rect.y) / fill.area.rect.h;
-            const sx = sampleImageSourceCoord(source.x + @min(0.999999, @max(0.0, u)) * source.w, image.width);
-            const sy = sampleImageSourceCoord(source.y + @min(0.999999, @max(0.0, v)) * source.h, image.height);
+            const sx = source.x + @min(0.999999, @max(0.0, u)) * source.w;
+            const sy = source.y + @min(0.999999, @max(0.0, v)) * source.h;
             try appendStrip(
                 allocator,
                 strips,
                 x,
                 y,
                 1,
-                applyOpacity(image.pixels[sy * image.width + sx], fill.opacity),
+                applyOpacity(sampleImageSourceBilinear(image, sx, sy), fill.opacity),
                 fill.blend_mode,
             );
         }
@@ -4375,6 +4375,36 @@ fn sampleImageSourceCoord(coord: f32, extent: u32) u32 {
     if (extent == 0) return 0;
     const clamped = @min(@as(f32, @floatFromInt(extent)) - 0.000001, @max(0.0, coord));
     return @intFromFloat(@floor(clamped));
+}
+
+fn sampleImageSourceBilinear(image: *const ImageSource, x: f32, y: f32) Color {
+    if (image.width == 0 or image.height == 0) return .transparent;
+    const max_x = @as(f32, @floatFromInt(image.width - 1));
+    const max_y = @as(f32, @floatFromInt(image.height - 1));
+    const fx = std.math.clamp(x - 0.5, 0.0, max_x);
+    const fy = std.math.clamp(y - 0.5, 0.0, max_y);
+    const x0: u32 = @intFromFloat(@floor(fx));
+    const y0: u32 = @intFromFloat(@floor(fy));
+    const x1 = @min(x0 + 1, image.width - 1);
+    const y1 = @min(y0 + 1, image.height - 1);
+    const tx = fx - @as(f32, @floatFromInt(x0));
+    const ty = fy - @as(f32, @floatFromInt(y0));
+    const c00 = image.pixels[@as(usize, y0) * image.width + x0];
+    const c10 = image.pixels[@as(usize, y0) * image.width + x1];
+    const c01 = image.pixels[@as(usize, y1) * image.width + x0];
+    const c11 = image.pixels[@as(usize, y1) * image.width + x1];
+    return Color.rgba(
+        bilerpChannel(c00.r, c10.r, c01.r, c11.r, tx, ty),
+        bilerpChannel(c00.g, c10.g, c01.g, c11.g, tx, ty),
+        bilerpChannel(c00.b, c10.b, c01.b, c11.b, tx, ty),
+        bilerpChannel(c00.a, c10.a, c01.a, c11.a, tx, ty),
+    );
+}
+
+fn bilerpChannel(c00: u8, c10: u8, c01: u8, c11: u8, tx: f32, ty: f32) u8 {
+    const top = @as(f32, @floatFromInt(c00)) + (@as(f32, @floatFromInt(c10)) - @as(f32, @floatFromInt(c00))) * tx;
+    const bottom = @as(f32, @floatFromInt(c01)) + (@as(f32, @floatFromInt(c11)) - @as(f32, @floatFromInt(c01))) * tx;
+    return @intFromFloat(@round(std.math.clamp(top + (bottom - top) * ty, 0.0, 255.0)));
 }
 
 fn localSamplePoint(inverse: math.Affine2D, x: u32, y: u32) math.Vec2 {
@@ -8106,6 +8136,29 @@ test "image sub-rectangles sample atlas regions" {
     try std.testing.expectEqual(@as(usize, 2), strips.items.len);
     try std.testing.expectEqual(Color.green, strips.items[0].color);
     try std.testing.expectEqual(Color.blue, strips.items[1].color);
+}
+
+test "image rectangles bilinear sample scaled pixels" {
+    const allocator = std.testing.allocator;
+    var image = try Image.init(allocator, 2, 2, .transparent);
+    defer image.deinit();
+    image.writePixel(0, 0, .black);
+    image.writePixel(1, 0, .white);
+    image.writePixel(0, 1, .white);
+    image.writePixel(1, 1, .white);
+
+    var scene = Scene2D.init(allocator);
+    defer scene.deinit();
+    try scene.fillImageRect(.{ .x = 0, .y = 0, .w = 1, .h = 1 }, &image);
+
+    var strips = try scene.buildSparseStrips(allocator, 1, 1);
+    defer strips.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), strips.items.len);
+    const sampled = strips.items[0].color;
+    try std.testing.expect(sampled.r > 180 and sampled.r < 200);
+    try std.testing.expect(sampled.g > 180 and sampled.g < 200);
+    try std.testing.expect(sampled.b > 180 and sampled.b < 200);
 }
 
 test "masked rectangles scale alpha from mask image" {

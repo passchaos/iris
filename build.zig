@@ -229,6 +229,28 @@ pub fn build(b: *std.Build) void {
     const compare_3d_backends_step = b.step("compare-3d-backends", "Compare CPU 3D rendering with the software backend using Image.compare");
     compare_3d_backends_step.dependOn(&b.addRunArtifact(compare_3d_backends_exe).step);
 
+    if (zgpu_dependency) |zgpu_dep| {
+        const compare_2d_webgpu_exe = b.addExecutable(.{
+            .name = "iris-compare-2d-webgpu",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/compare_2d_webgpu.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "iris", .module = mod },
+                    .{ .name = "zgpu", .module = zgpu_dep.module("root") },
+                },
+            }),
+        });
+        linkZgpuIfEnabled(zgpu_dependency, compare_2d_webgpu_exe);
+        if (target.result.os.tag == .linux) {
+            compare_2d_webgpu_exe.root_module.linkSystemLibrary("X11", .{});
+            compare_2d_webgpu_exe.root_module.linkSystemLibrary("c", .{});
+        }
+        const compare_2d_webgpu_step = b.step("compare-2d-webgpu", "Compare CPU 2D rendering with WebGPU readback on a real device");
+        compare_2d_webgpu_step.dependOn(&b.addRunArtifact(compare_2d_webgpu_exe).step);
+    }
+
     if (zgpu_dependency != null and objc_dependency != null) {
         const objc_dep = objc_dependency.?;
         const compare_3d_webgpu_exe = b.addExecutable(.{
@@ -400,13 +422,38 @@ fn linkZgpuIfEnabled(zgpu_dependency: ?*std.Build.Dependency, compile_step: *std
 }
 
 fn linkZgpuDependency(dep: *std.Build.Dependency, compile_step: *std.Build.Step.Compile) void {
-    const zgpu_build = @import("zgpu");
     compile_step.root_module.linkLibrary(dep.artifact("zdawn"));
-    zgpu_build.linkSystemDeps(dep.builder, compile_step);
+    linkZgpuSystemDeps(dep.builder, compile_step);
     addZgpuDawnLibraryPath(dep, compile_step);
     compile_step.root_module.linkSystemLibrary("dawn", .{});
     if (compile_step.rootModuleTarget().os.tag == .macos) {
         compile_step.root_module.linkFramework("CoreFoundation", .{});
+    }
+}
+
+fn linkZgpuSystemDeps(b: *std.Build, compile_step: *std.Build.Step.Compile) void {
+    switch (compile_step.rootModuleTarget().os.tag) {
+        .windows => {
+            if (b.lazyDependency("system_sdk", .{})) |system_sdk| {
+                compile_step.root_module.addLibraryPath(system_sdk.path("windows/lib/x86_64-windows-gnu"));
+            }
+            compile_step.root_module.linkSystemLibrary("ole32", .{});
+            compile_step.root_module.linkSystemLibrary("dxguid", .{});
+        },
+        .macos => {
+            if (b.lazyDependency("system_sdk", .{})) |system_sdk| {
+                compile_step.root_module.addLibraryPath(system_sdk.path("macos12/usr/lib"));
+                compile_step.root_module.addFrameworkPath(system_sdk.path("macos12/System/Library/Frameworks"));
+            }
+            compile_step.root_module.linkSystemLibrary("objc", .{});
+            compile_step.root_module.linkFramework("Metal", .{});
+            compile_step.root_module.linkFramework("CoreGraphics", .{});
+            compile_step.root_module.linkFramework("Foundation", .{});
+            compile_step.root_module.linkFramework("IOKit", .{});
+            compile_step.root_module.linkFramework("IOSurface", .{});
+            compile_step.root_module.linkFramework("QuartzCore", .{});
+        },
+        else => {},
     }
 }
 
