@@ -15,6 +15,7 @@ pub const BatchKind = enum {
     shape,
     paint_quad,
     text,
+    color_text,
     line_aa,
     image,
 };
@@ -40,6 +41,20 @@ pub const TextureResource = struct {
     view: backend.TextureViewHandle,
     sampler: backend.SamplerHandle,
     bind_group: backend.BindGroupHandle,
+};
+
+pub const WindowTextDebugSnapshot = struct {
+    backend: window.Backend,
+    frame_index: u64,
+    font_count: usize,
+    default_font: ?window.TextFontId,
+    atlas_nonzero_pixels: usize,
+    color_glyph_count: usize,
+    text_vertex_count: usize,
+    text_batch_count: usize,
+    color_text_batch_count: usize,
+    image_batch_count: usize,
+    batch_count: usize,
 };
 
 pub const ResolveBatchTextureFn = *const fn (context: *anyopaque, batch: Batch) ?TextureResource;
@@ -336,6 +351,22 @@ pub const WindowRenderer = struct {
         return self.image_store.cpuProvider();
     }
 
+    pub fn textDebugSnapshot(self: *const WindowRenderer) WindowTextDebugSnapshot {
+        return .{
+            .backend = self.backend_kind,
+            .frame_index = self.frame_index,
+            .font_count = self.text_store.fonts.items.len,
+            .default_font = self.text_store.default_font,
+            .atlas_nonzero_pixels = self.text_store.countAtlasNonzeroPixels(),
+            .color_glyph_count = self.text_store.countColorGlyphs(),
+            .text_vertex_count = self.scene.text_vertices.items.len,
+            .text_batch_count = countBatches(self.scene.batches.items, .text),
+            .color_text_batch_count = countBatches(self.scene.batches.items, .color_text),
+            .image_batch_count = countBatches(self.scene.batches.items, .image),
+            .batch_count = self.scene.batches.items.len,
+        };
+    }
+
     pub fn endCpuFrame(self: *WindowRenderer) void {
         if (!self.frame_active) return;
         self.frame_index += 1;
@@ -499,6 +530,14 @@ pub const WindowRenderer = struct {
     }
 };
 
+fn countBatches(batches: []const Batch, kind: BatchKind) usize {
+    var count: usize = 0;
+    for (batches) |batch| {
+        if (batch.kind == kind) count += 1;
+    }
+    return count;
+}
+
 fn resolveWindowBatchTexture(context: *anyopaque, batch: Batch) ?TextureResource {
     const renderer: *WindowRenderer = @ptrCast(@alignCast(context));
     return switch (batch.kind) {
@@ -522,6 +561,9 @@ pub const ResolvedTextGlyph = struct {
 };
 
 pub const ResolveTextGlyphFn = *const fn (context: *anyopaque, base_font_id: window.TextFontId, codepoint: u21) ?ResolvedTextGlyph;
+pub const ResolveTextGlyphIdFn = *const fn (context: *anyopaque, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?ResolvedTextGlyph;
+pub const ResolveTextColorGlyphIdFn = *const fn (context: *anyopaque, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?ResolvedTextGlyph;
+pub const ShapeTextFn = *const fn (context: *anyopaque, allocator: std.mem.Allocator, base_font_id: window.TextFontId, text: []const u8, size: f32) ?[]window_draw.ShapedTextGlyph;
 pub const FontMetricsFn = *const fn (context: *anyopaque, font_id: window.TextFontId) ?FontMetrics;
 pub const DefaultFontFn = *const fn (context: *anyopaque) ?window.TextFontId;
 
@@ -537,12 +579,17 @@ pub const TextProvider = struct {
     defaultFontFn: DefaultFontFn,
     fontMetricsFn: FontMetricsFn,
     resolveGlyphFn: ResolveTextGlyphFn,
+    resolveGlyphIdFn: ResolveTextGlyphIdFn,
+    resolveColorGlyphIdFn: ResolveTextColorGlyphIdFn,
+    shapeTextFn: ShapeTextFn,
 };
 
 const FontKind = enum {
     bitmap,
     truetype,
 };
+
+const max_text_font_file_bytes = 256 * 1024 * 1024;
 
 const FontState = enum(u2) {
     alive,
@@ -567,15 +614,33 @@ const TextFont = struct {
     atlas_w: u32,
     atlas_h: u32,
     atlas_pixels: []u8,
+    color_atlas_pixels: []u8,
     cursor_x: u32,
     cursor_y: u32,
     row_h: u32,
-    glyphs: std.AutoHashMap(u21, TextGlyph),
+    color_cursor_x: u32,
+    color_cursor_y: u32,
+    color_row_h: u32,
+    glyphs: std.AutoHashMap(TextGlyphKey, TextGlyph),
+    color_glyphs: std.AutoHashMap(TextGlyphKey, ColorTextGlyph),
     gpu_texture: ?TextureResource,
+    color_gpu_texture: ?TextureResource,
     fallback: ?window.TextFontId,
     font_data: ?[]u8 = null,
     parsed_font: ?cangjie.Font = null,
     raster_scale: f32 = 1.0,
+};
+
+const ColorTextGlyph = struct {
+    glyph: TextGlyph,
+    width: u32,
+    height: u32,
+    rgba_pixels: []u8,
+};
+
+const TextGlyphKey = union(enum) {
+    codepoint: u21,
+    glyph_id: cangjie.GlyphId,
 };
 
 pub const TextAtlasStore = struct {
@@ -615,14 +680,14 @@ pub const TextAtlasStore = struct {
 
     pub fn setDefaultTextFontFromFile(self: *TextAtlasStore, io: std.Io, path: []const u8, size_px: f32, raster_scale: f32) !window.TextFontId {
         const fallback = self.default_font;
-        const font_data = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(64 * 1024 * 1024));
+        const font_data = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(max_text_font_file_bytes));
         const font_id = try self.createTrueTypeFontUncached(font_data, size_px, fallback, raster_scale);
         self.default_font = font_id;
         return font_id;
     }
 
     pub fn addTextFontFromFile(self: *TextAtlasStore, io: std.Io, path: []const u8, size_px: f32, fallback: ?window.TextFontId, raster_scale: f32) !window.TextFontId {
-        const font_data = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(64 * 1024 * 1024));
+        const font_data = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(max_text_font_file_bytes));
         return try self.createTrueTypeFontUncached(font_data, size_px, fallback, raster_scale);
     }
 
@@ -681,6 +746,7 @@ pub const TextAtlasStore = struct {
         const base_font = self.fontById(base_font_id) orelse return .{ .w = 0, .h = font_size };
         const base_scale = font_size / base_font.size_px;
         const line_height = (base_font.ascent - base_font.descent + base_font.line_gap) * base_scale;
+        if (self.measureTextShaped(base_font, text, font_size, line_height)) |size| return size;
 
         var max_x: f32 = 0;
         var pen_x: f32 = 0;
@@ -703,12 +769,74 @@ pub const TextAtlasStore = struct {
         return .{ .w = max_x, .h = @as(f32, @floatFromInt(lines)) * line_height };
     }
 
+    fn measureTextShaped(self: *TextAtlasStore, font_value: *TextFont, text: []const u8, font_size: f32, line_height: f32) ?window.Size {
+        const parsed_font = &(font_value.parsed_font orelse return null);
+        var layout_buffer = cangjie.LayoutBuffer.init(self.allocator);
+        defer layout_buffer.deinit();
+
+        var max_width: f32 = 0.0;
+        var line_count: usize = 0;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            line_count += 1;
+            const run = cangjie.TextShaper.shapeUtf8(parsed_font, &layout_buffer, line, font_size) catch return null;
+            max_width = @max(max_width, run.width());
+        }
+        if (line_count == 0) line_count = 1;
+        return .{ .w = max_width, .h = @as(f32, @floatFromInt(line_count)) * line_height };
+    }
+
+    fn shapeText(self: *TextAtlasStore, allocator: std.mem.Allocator, base_font_id: window.TextFontId, text: []const u8, size: f32) ?[]window_draw.ShapedTextGlyph {
+        var cascade_fonts_buf: [8]*const cangjie.Font = undefined;
+        var cascade_ids_buf: [8]window.TextFontId = undefined;
+        var cascade_len: usize = 0;
+        var current: ?window.TextFontId = base_font_id;
+        var guard: u8 = 0;
+        while (current) |font_id_value| : (guard += 1) {
+            if (guard >= cascade_fonts_buf.len) break;
+            const font_value = self.fontById(font_id_value) orelse break;
+            const parsed_font = &(font_value.parsed_font orelse break);
+            cascade_fonts_buf[cascade_len] = parsed_font;
+            cascade_ids_buf[cascade_len] = font_id_value;
+            cascade_len += 1;
+            current = font_value.fallback;
+        }
+        if (cascade_len == 0) return null;
+
+        var layout_buffer = cangjie.LayoutBuffer.init(self.allocator);
+        defer layout_buffer.deinit();
+        const cascade = cangjie.FontCascade.init(cascade_fonts_buf[0..cascade_len]);
+        const shaped = cangjie.TextShaper.shapeUtf8Cascade(cascade, &layout_buffer, text, size) catch return null;
+        const out = allocator.alloc(window_draw.ShapedTextGlyph, shaped.glyphs.len) catch return null;
+        errdefer allocator.free(out);
+        for (shaped.runs) |run| {
+            if (run.font_index >= cascade_len) return null;
+            const font_id = cascade_ids_buf[run.font_index];
+            var x: f32 = run.x_offset;
+            const end = run.glyph_start + run.glyph_len;
+            for (shaped.glyphs[run.glyph_start..end], run.glyph_start..) |glyph, index| {
+                out[index] = .{
+                    .font_index = @intCast(font_id),
+                    .glyph_id = glyph.glyph_id,
+                    .x_offset = x + glyph.x_offset,
+                    .y_offset = glyph.y_offset,
+                    .x_advance = glyph.x_advance,
+                };
+                x += glyph.x_advance;
+            }
+        }
+        return out;
+    }
+
     pub fn textProvider(self: *TextAtlasStore) TextProvider {
         return .{
             .context = self,
             .defaultFontFn = gpuDefaultFont,
             .fontMetricsFn = gpuFontMetrics,
             .resolveGlyphFn = resolveGpuGlyph,
+            .resolveGlyphIdFn = resolveGpuGlyphId,
+            .resolveColorGlyphIdFn = resolveGpuColorGlyphId,
+            .shapeTextFn = shapeGpuText,
         };
     }
 
@@ -719,18 +847,46 @@ pub const TextAtlasStore = struct {
             .fontCountFn = cpuFontCount,
             .fontFn = cpuFont,
             .resolveGlyphFn = resolveCpuGlyph,
+            .resolveGlyphIdFn = resolveCpuGlyphId,
+            .resolveColorGlyphFn = resolveCpuColorGlyph,
+            .resolveColorGlyphIdFn = resolveCpuColorGlyphId,
+            .shapeTextFn = shapeCpuText,
         };
     }
 
     pub fn textureForBatch(self: *TextAtlasStore, batch: Batch) ?TextureResource {
-        if (batch.kind != .text) return null;
+        if (batch.kind != .text and batch.kind != .color_text) return null;
         const font_id = batch.font_id orelse return null;
         const font = self.fontById(font_id) orelse return null;
-        return font.gpu_texture;
+        return switch (batch.kind) {
+            .text => font.gpu_texture,
+            .color_text => font.color_gpu_texture,
+            else => null,
+        };
     }
 
     pub fn fontCount(self: *const TextAtlasStore) usize {
         return self.fonts.items.len;
+    }
+
+    fn countAtlasNonzeroPixels(self: *const TextAtlasStore) usize {
+        var count: usize = 0;
+        for (self.fonts.items) |font| {
+            if (font.state == .destroyed) continue;
+            for (font.atlas_pixels) |pixel| {
+                if (pixel != 0) count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn countColorGlyphs(self: *const TextAtlasStore) usize {
+        var count: usize = 0;
+        for (self.fonts.items) |font| {
+            if (font.state == .destroyed) continue;
+            count += font.color_glyphs.count();
+        }
+        return count;
     }
 
     fn fontById(self: *TextAtlasStore, font_id: window.TextFontId) ?*TextFont {
@@ -743,9 +899,13 @@ pub const TextAtlasStore = struct {
         const atlas_w: u32 = 256;
         const atlas_h: u32 = 256;
         const atlas_pixels = try self.allocator.alloc(u8, @as(usize, atlas_w) * @as(usize, atlas_h));
+        const color_atlas_pixels = try self.allocator.alloc(u8, @as(usize, atlas_w) * @as(usize, atlas_h) * 4);
         @memset(atlas_pixels, 0);
+        @memset(color_atlas_pixels, 0);
         const gpu_texture = self.createGpuTexture(atlas_w, atlas_h);
-        const glyphs = std.AutoHashMap(u21, TextGlyph).init(self.allocator);
+        const color_gpu_texture = self.createColorGpuTexture(atlas_w, atlas_h);
+        const glyphs = std.AutoHashMap(TextGlyphKey, TextGlyph).init(self.allocator);
+        const color_glyphs = std.AutoHashMap(TextGlyphKey, ColorTextGlyph).init(self.allocator);
         const id: window.TextFontId = @intCast(self.fonts.items.len);
         var font = TextFont{
             .id = id,
@@ -759,16 +919,22 @@ pub const TextAtlasStore = struct {
             .atlas_w = atlas_w,
             .atlas_h = atlas_h,
             .atlas_pixels = atlas_pixels,
+            .color_atlas_pixels = color_atlas_pixels,
             .cursor_x = 1,
             .cursor_y = 1,
             .row_h = 0,
+            .color_cursor_x = 1,
+            .color_cursor_y = 1,
+            .color_row_h = 0,
             .glyphs = glyphs,
+            .color_glyphs = color_glyphs,
             .gpu_texture = gpu_texture,
+            .color_gpu_texture = color_gpu_texture,
             .fallback = fallback,
         };
         var cp: u21 = 32;
         while (cp < 127) : (cp += 1) try bakeBitmapGlyph(&font, cp);
-        if (!font.glyphs.contains('?')) try bakeBitmapGlyph(&font, '?');
+        if (!font.glyphs.contains(.{ .codepoint = '?' })) try bakeBitmapGlyph(&font, '?');
         self.uploadAtlas(&font, 0, 0, atlas_w, atlas_h);
         try self.fonts.append(self.allocator, font);
         return id;
@@ -782,12 +948,18 @@ pub const TextAtlasStore = struct {
         const atlas_w: u32 = if (raster_scale > 1.25) 2048 else 1024;
         const atlas_h: u32 = if (raster_scale > 1.25) 2048 else 1024;
         const atlas_pixels = try self.allocator.alloc(u8, @as(usize, atlas_w) * @as(usize, atlas_h));
+        const color_atlas_pixels = try self.allocator.alloc(u8, @as(usize, atlas_w) * @as(usize, atlas_h) * 4);
         var own_atlas_pixels = true;
+        var own_color_atlas_pixels = true;
         errdefer if (own_atlas_pixels) self.allocator.free(atlas_pixels);
+        errdefer if (own_color_atlas_pixels) self.allocator.free(color_atlas_pixels);
         @memset(atlas_pixels, 0);
+        @memset(color_atlas_pixels, 0);
 
         const gpu_texture = self.createGpuTexture(atlas_w, atlas_h);
-        const glyphs = std.AutoHashMap(u21, TextGlyph).init(self.allocator);
+        const color_gpu_texture = self.createColorGpuTexture(atlas_w, atlas_h);
+        const glyphs = std.AutoHashMap(TextGlyphKey, TextGlyph).init(self.allocator);
+        const color_glyphs = std.AutoHashMap(TextGlyphKey, ColorTextGlyph).init(self.allocator);
         const id: window.TextFontId = @intCast(self.fonts.items.len);
         var parsed_font = try cangjie.Font.parse(self.allocator, font_data);
         var own_parsed_font = true;
@@ -804,11 +976,17 @@ pub const TextAtlasStore = struct {
             .atlas_w = atlas_w,
             .atlas_h = atlas_h,
             .atlas_pixels = atlas_pixels,
+            .color_atlas_pixels = color_atlas_pixels,
             .cursor_x = 1,
             .cursor_y = 1,
             .row_h = 0,
+            .color_cursor_x = 1,
+            .color_cursor_y = 1,
+            .color_row_h = 0,
             .glyphs = glyphs,
+            .color_glyphs = color_glyphs,
             .gpu_texture = gpu_texture,
+            .color_gpu_texture = color_gpu_texture,
             .fallback = fallback,
             .font_data = font_data,
             .parsed_font = parsed_font,
@@ -816,6 +994,7 @@ pub const TextAtlasStore = struct {
         };
         own_font_data = false;
         own_atlas_pixels = false;
+        own_color_atlas_pixels = false;
         own_parsed_font = false;
         errdefer self.destroyFontResources(&font_value);
 
@@ -839,14 +1018,23 @@ pub const TextAtlasStore = struct {
         return createTextureResource(gctx, layout, width, height, .alpha);
     }
 
+    fn createColorGpuTexture(self: *TextAtlasStore, width: u32, height: u32) ?TextureResource {
+        const gctx = self.gpu_context orelse return null;
+        const layout = self.texture_bind_group_layout orelse return null;
+        return createTextureResource(gctx, layout, width, height, .rgba);
+    }
+
     fn destroyFontResources(self: *TextAtlasStore, font_value: *TextFont) void {
-        if (backend.compiled_with_zgpu) {
-            if (self.gpu_context) |ctx| {
-                if (font_value.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
-            }
+        if (self.gpu_context) |ctx| {
+            if (font_value.gpu_texture) |*texture| destroyTextureResource(ctx, texture);
+            if (font_value.color_gpu_texture) |*texture| destroyTextureResource(ctx, texture);
         }
         if (font_value.parsed_font) |*parsed_font| parsed_font.deinit();
         if (font_value.font_data) |font_data| self.allocator.free(font_data);
+        var color_it = font_value.color_glyphs.valueIterator();
+        while (color_it.next()) |color_glyph| self.allocator.free(color_glyph.rgba_pixels);
+        font_value.color_glyphs.deinit();
+        self.allocator.free(font_value.color_atlas_pixels);
         self.allocator.free(font_value.atlas_pixels);
         font_value.glyphs.deinit();
         font_value.state = .destroyed;
@@ -857,10 +1045,10 @@ pub const TextAtlasStore = struct {
         var guard: u8 = 0;
         while (guard < 8) : (guard += 1) {
             const current_font = self.fontById(current) orelse return null;
-            if (current_font.glyphs.get(codepoint)) |glyph| return .{ .font_id = current, .glyph = glyph };
+            if (current_font.glyphs.get(.{ .codepoint = codepoint })) |glyph| return .{ .font_id = current, .glyph = glyph };
             if (current_font.kind == .truetype) {
                 bakeTrueTypeGlyph(current_font, codepoint) catch {};
-                if (current_font.glyphs.get(codepoint)) |glyph| {
+                if (current_font.glyphs.get(.{ .codepoint = codepoint })) |glyph| {
                     self.uploadAtlas(current_font, 0, 0, current_font.atlas_w, current_font.atlas_h);
                     return .{ .font_id = current, .glyph = glyph };
                 }
@@ -869,10 +1057,74 @@ pub const TextAtlasStore = struct {
                 current = fb;
                 continue;
             }
-            if (current_font.glyphs.get('?')) |glyph| return .{ .font_id = current, .glyph = glyph };
+            if (current_font.glyphs.get(.{ .codepoint = '?' })) |glyph| return .{ .font_id = current, .glyph = glyph };
             break;
         }
         return null;
+    }
+
+    fn resolveGlyphId(self: *TextAtlasStore, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?ResolvedTextGlyph {
+        const font_value = self.fontById(font_id) orelse return null;
+        if (font_value.glyphs.get(.{ .glyph_id = glyph_id })) |glyph| return .{ .font_id = font_id, .glyph = glyph };
+        if (font_value.kind != .truetype) return null;
+        bakeTrueTypeGlyphId(font_value, glyph_id, null) catch return null;
+        if (font_value.glyphs.get(.{ .glyph_id = glyph_id })) |glyph| {
+            self.uploadAtlas(font_value, 0, 0, font_value.atlas_w, font_value.atlas_h);
+            return .{ .font_id = font_id, .glyph = glyph };
+        }
+        return null;
+    }
+
+    fn resolveColorGlyphId(self: *TextAtlasStore, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?window_draw.TextColorGlyph {
+        const font_value = self.fontById(font_id) orelse return null;
+        if (font_value.color_glyphs.get(.{ .glyph_id = glyph_id }) == null and !self.ensureColorGlyphId(font_value, glyph_id, null)) return null;
+        const color_glyph = font_value.color_glyphs.get(.{ .glyph_id = glyph_id }) orelse return null;
+        return .{
+            .glyph = .{
+                .uv0 = color_glyph.glyph.uv0,
+                .uv1 = color_glyph.glyph.uv1,
+                .size = color_glyph.glyph.size,
+                .bearing = color_glyph.glyph.bearing,
+                .advance = color_glyph.glyph.advance,
+            },
+            .width = color_glyph.width,
+            .height = color_glyph.height,
+            .rgba_pixels = color_glyph.rgba_pixels,
+        };
+    }
+
+    fn resolveColorGlyph(self: *TextAtlasStore, font_id: window.TextFontId, codepoint: u21) ?window_draw.TextColorGlyph {
+        const font_value = self.fontById(font_id) orelse return null;
+        if (font_value.color_glyphs.get(.{ .codepoint = codepoint })) |color_glyph| {
+            return .{
+                .glyph = .{
+                    .uv0 = color_glyph.glyph.uv0,
+                    .uv1 = color_glyph.glyph.uv1,
+                    .size = color_glyph.glyph.size,
+                    .bearing = color_glyph.glyph.bearing,
+                    .advance = color_glyph.glyph.advance,
+                },
+                .width = color_glyph.width,
+                .height = color_glyph.height,
+                .rgba_pixels = color_glyph.rgba_pixels,
+            };
+        }
+        if (font_value.kind != .truetype) return null;
+        const parsed_font = &(font_value.parsed_font orelse return null);
+        const glyph_id = parsed_font.glyphIndex(codepoint) catch return null;
+        if (glyph_id == 0) return null;
+        if (!self.ensureColorGlyphId(font_value, glyph_id, codepoint)) return null;
+        return self.resolveColorGlyphId(font_id, glyph_id);
+    }
+
+    fn ensureColorGlyphId(self: *TextAtlasStore, font_value: *TextFont, glyph_id: cangjie.GlyphId, maybe_codepoint: ?u21) bool {
+        if (font_value.color_glyphs.get(.{ .glyph_id = glyph_id }) != null) return true;
+        if (font_value.kind != .truetype) return false;
+        const parsed_font = &(font_value.parsed_font orelse return false);
+        const baked = bakeTrueTypeBitmapGlyph(font_value, parsed_font, glyph_id, maybe_codepoint) catch return false;
+        if (!baked) return false;
+        self.uploadAtlas(font_value, 0, 0, font_value.atlas_w, font_value.atlas_h);
+        return true;
     }
 
     fn uploadAtlas(self: *TextAtlasStore, font_value: *const TextFont, x: u32, y: u32, w: u32, h: u32) void {
@@ -880,6 +1132,9 @@ pub const TextAtlasStore = struct {
         const gctx = self.gpu_context orelse return;
         const texture = font_value.gpu_texture orelse return;
         uploadAlphaAtlas(gctx, texture, font_value.atlas_pixels, font_value.atlas_w, font_value.atlas_h, x, y, w, h);
+        if (font_value.color_gpu_texture) |color_texture| {
+            uploadRgbaPixels(self.allocator, gctx, color_texture, font_value.color_atlas_pixels) catch {};
+        }
     }
 };
 
@@ -923,6 +1178,36 @@ fn resolveCpuGlyph(context: *anyopaque, base_font_index: usize, codepoint: u21) 
     };
 }
 
+fn resolveCpuGlyphId(context: *anyopaque, font_index: usize, glyph_id: cangjie.GlyphId) ?window_draw.ResolvedGlyph {
+    const store: *TextAtlasStore = @ptrCast(@alignCast(context));
+    const resolved = store.resolveGlyphId(@intCast(font_index), glyph_id) orelse return null;
+    return .{
+        .font_index = @intCast(resolved.font_id),
+        .glyph = .{
+            .uv0 = resolved.glyph.uv0,
+            .uv1 = resolved.glyph.uv1,
+            .size = resolved.glyph.size,
+            .bearing = resolved.glyph.bearing,
+            .advance = resolved.glyph.advance,
+        },
+    };
+}
+
+fn resolveCpuColorGlyph(context: *anyopaque, base_font_index: usize, codepoint: u21) ?window_draw.TextColorGlyph {
+    const store: *TextAtlasStore = @ptrCast(@alignCast(context));
+    return store.resolveColorGlyph(@intCast(base_font_index), codepoint);
+}
+
+fn resolveCpuColorGlyphId(context: *anyopaque, font_index: usize, glyph_id: cangjie.GlyphId) ?window_draw.TextColorGlyph {
+    const store: *TextAtlasStore = @ptrCast(@alignCast(context));
+    return store.resolveColorGlyphId(@intCast(font_index), glyph_id);
+}
+
+fn shapeCpuText(context: *anyopaque, allocator: std.mem.Allocator, base_font_index: usize, text: []const u8, size: f32) ?[]window_draw.ShapedTextGlyph {
+    const store: *TextAtlasStore = @ptrCast(@alignCast(context));
+    return store.shapeText(allocator, @intCast(base_font_index), text, size);
+}
+
 fn gpuDefaultFont(context: *anyopaque) ?window.TextFontId {
     const store: *TextAtlasStore = @ptrCast(@alignCast(context));
     return store.default_font;
@@ -944,6 +1229,31 @@ fn resolveGpuGlyph(context: *anyopaque, base_font_id: window.TextFontId, codepoi
     return store.resolveGlyph(base_font_id, codepoint);
 }
 
+fn resolveGpuGlyphId(context: *anyopaque, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?ResolvedTextGlyph {
+    const store: *TextAtlasStore = @ptrCast(@alignCast(context));
+    return store.resolveGlyphId(font_id, glyph_id);
+}
+
+fn resolveGpuColorGlyphId(context: *anyopaque, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?ResolvedTextGlyph {
+    const store: *TextAtlasStore = @ptrCast(@alignCast(context));
+    const color_glyph = store.resolveColorGlyphId(font_id, glyph_id) orelse return null;
+    return .{
+        .font_id = font_id,
+        .glyph = .{
+            .uv0 = color_glyph.glyph.uv0,
+            .uv1 = color_glyph.glyph.uv1,
+            .size = color_glyph.glyph.size,
+            .bearing = color_glyph.glyph.bearing,
+            .advance = color_glyph.glyph.advance,
+        },
+    };
+}
+
+fn shapeGpuText(context: *anyopaque, allocator: std.mem.Allocator, base_font_id: window.TextFontId, text: []const u8, size: f32) ?[]window_draw.ShapedTextGlyph {
+    const store: *TextAtlasStore = @ptrCast(@alignCast(context));
+    return store.shapeText(allocator, base_font_id, text, size);
+}
+
 fn allocAtlasRegion(font_value: *TextFont, w: u32, h: u32) ?struct { x: u32, y: u32 } {
     if (font_value.cursor_x + w + 1 > font_value.atlas_w) {
         font_value.cursor_x = 1;
@@ -955,6 +1265,20 @@ fn allocAtlasRegion(font_value: *TextFont, w: u32, h: u32) ?struct { x: u32, y: 
     const y = font_value.cursor_y;
     font_value.cursor_x += w + 1;
     if (h > font_value.row_h) font_value.row_h = h;
+    return .{ .x = x, .y = y };
+}
+
+fn allocColorAtlasRegion(font_value: *TextFont, w: u32, h: u32) ?struct { x: u32, y: u32 } {
+    if (font_value.color_cursor_x + w + 1 > font_value.atlas_w) {
+        font_value.color_cursor_x = 1;
+        font_value.color_cursor_y += font_value.color_row_h + 1;
+        font_value.color_row_h = 0;
+    }
+    if (font_value.color_cursor_y + h + 1 > font_value.atlas_h) return null;
+    const x = font_value.color_cursor_x;
+    const y = font_value.color_cursor_y;
+    font_value.color_cursor_x += w + 1;
+    if (h > font_value.color_row_h) font_value.color_row_h = h;
     return .{ .x = x, .y = y };
 }
 
@@ -976,7 +1300,7 @@ fn bakeBitmapGlyph(font_value: *TextFont, codepoint: u21) !void {
             }
         }
     }
-    try font_value.glyphs.put(@intCast(codepoint), .{
+    try font_value.glyphs.put(.{ .codepoint = @intCast(codepoint) }, .{
         .uv0 = .{
             @as(f32, @floatFromInt(region.x)) / @as(f32, @floatFromInt(font_value.atlas_w)),
             @as(f32, @floatFromInt(region.y)) / @as(f32, @floatFromInt(font_value.atlas_h)),
@@ -995,6 +1319,7 @@ fn bakeTrueTypeGlyph(font_value: *TextFont, codepoint: u21) !void {
     const parsed_font = &(font_value.parsed_font orelse return error.InvalidTextFont);
     const glyph_id = try parsed_font.glyphIndex(codepoint);
     if (glyph_id == 0) return error.InvalidGlyph;
+    if (try bakeTrueTypeBitmapGlyph(font_value, parsed_font, glyph_id, codepoint)) return;
 
     var layout_buffer = cangjie.LayoutBuffer.init(font_value.glyphs.allocator);
     defer layout_buffer.deinit();
@@ -1015,6 +1340,7 @@ fn bakeTrueTypeGlyph(font_value: *TextFont, codepoint: u21) !void {
     var target = try cangjie.RenderTarget.init(font_value.glyphs.allocator, gw, gh);
     defer target.deinit();
     var rasterizer = cangjie.Rasterizer.init(font_value.glyphs.allocator);
+    rasterizer.samples_per_axis = 8;
     rasterizer.hint_size_px = font_value.size_px;
     try rasterizer.renderRun(&target, run, 2.0, 2.0 + ascent);
 
@@ -1034,7 +1360,7 @@ fn bakeTrueTypeGlyph(font_value: *TextFont, codepoint: u21) !void {
     const metrics = try parsed_font.horizontalMetrics(glyph_id);
     const measured_advance = if (run.glyphs.len == 1) run.glyphs[0].x_advance else @as(f32, @floatFromInt(metrics.advance_width)) * scale;
     const advance = @max(measured_advance, width_f * 0.48);
-    try font_value.glyphs.put(codepoint, .{
+    const glyph = TextGlyph{
         .uv0 = .{
             @as(f32, @floatFromInt(tight_region.x)) / @as(f32, @floatFromInt(font_value.atlas_w)),
             @as(f32, @floatFromInt(tight_region.y)) / @as(f32, @floatFromInt(font_value.atlas_h)),
@@ -1046,7 +1372,145 @@ fn bakeTrueTypeGlyph(font_value: *TextFont, codepoint: u21) !void {
         .size = .{ @as(f32, @floatFromInt(tight_w)) / raster_scale, @as(f32, @floatFromInt(tight_h)) / raster_scale },
         .bearing = .{ (@as(f32, @floatFromInt(ink.x0)) - 2.0) / raster_scale, (@as(f32, @floatFromInt(ink.y0)) - 2.0) / raster_scale },
         .advance = advance / raster_scale,
+    };
+    try font_value.glyphs.put(.{ .codepoint = codepoint }, glyph);
+    try font_value.glyphs.put(.{ .glyph_id = glyph_id }, glyph);
+}
+
+fn bakeTrueTypeGlyphId(font_value: *TextFont, glyph_id: cangjie.GlyphId, maybe_codepoint: ?u21) !void {
+    const parsed_font = &(font_value.parsed_font orelse return error.InvalidTextFont);
+    if (glyph_id == 0) return error.InvalidGlyph;
+    if (try bakeTrueTypeBitmapGlyph(font_value, parsed_font, glyph_id, maybe_codepoint)) return;
+
+    const raster_scale = @max(font_value.raster_scale, 1.0);
+    const raster_size = font_value.size_px * raster_scale;
+    const scale = raster_size / @as(f32, @floatFromInt(parsed_font.units_per_em));
+    const ascent = @max(0.0, @as(f32, @floatFromInt(parsed_font.ascender)) * scale);
+    const descent = @max(0.0, @as(f32, @floatFromInt(-parsed_font.descender)) * scale);
+    const metrics = try parsed_font.horizontalMetrics(glyph_id);
+    const advance = @as(f32, @floatFromInt(metrics.advance_width)) * scale;
+    const glyph_positions = [_]cangjie.GlyphPosition{.{
+        .glyph_id = glyph_id,
+        .codepoint = maybe_codepoint orelse 0,
+        .cluster = 0,
+        .x_advance = advance,
+    }};
+    const run = cangjie.GlyphRun{ .font = parsed_font, .font_size = raster_size, .glyphs = &glyph_positions };
+
+    const width_f = @max(1.0, @ceil(run.width()) + 4.0);
+    const height_f = @max(1.0, @ceil(ascent + descent) + 4.0);
+    const gw: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(std.math.maxInt(u32))), width_f));
+    const gh: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(std.math.maxInt(u32))), height_f));
+    var target = try cangjie.RenderTarget.init(font_value.glyphs.allocator, gw, gh);
+    defer target.deinit();
+    var rasterizer = cangjie.Rasterizer.init(font_value.glyphs.allocator);
+    rasterizer.samples_per_axis = 8;
+    rasterizer.hint_size_px = font_value.size_px;
+    try rasterizer.renderRun(&target, run, 2.0, 2.0 + ascent);
+
+    const ink = glyphInkBounds(&target) orelse GlyphInkBounds{ .x0 = 0, .y0 = 0, .x1 = gw, .y1 = gh };
+    const tight_w = ink.x1 - ink.x0;
+    const tight_h = ink.y1 - ink.y0;
+    const tight_region = allocAtlasRegion(font_value, tight_w, tight_h) orelse return error.TextAtlasFull;
+
+    var y: u32 = 0;
+    while (y < tight_h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < tight_w) : (x += 1) {
+            const idx = @as(usize, tight_region.y + y) * @as(usize, font_value.atlas_w) + @as(usize, tight_region.x + x);
+            font_value.atlas_pixels[idx] = textCoverageContrastByte(target.at(ink.x0 + x, ink.y0 + y));
+        }
+    }
+    const glyph = TextGlyph{
+        .uv0 = .{
+            @as(f32, @floatFromInt(tight_region.x)) / @as(f32, @floatFromInt(font_value.atlas_w)),
+            @as(f32, @floatFromInt(tight_region.y)) / @as(f32, @floatFromInt(font_value.atlas_h)),
+        },
+        .uv1 = .{
+            @as(f32, @floatFromInt(tight_region.x + tight_w)) / @as(f32, @floatFromInt(font_value.atlas_w)),
+            @as(f32, @floatFromInt(tight_region.y + tight_h)) / @as(f32, @floatFromInt(font_value.atlas_h)),
+        },
+        .size = .{ @as(f32, @floatFromInt(tight_w)) / raster_scale, @as(f32, @floatFromInt(tight_h)) / raster_scale },
+        .bearing = .{ (@as(f32, @floatFromInt(ink.x0)) - 2.0) / raster_scale, (@as(f32, @floatFromInt(ink.y0)) - 2.0) / raster_scale },
+        .advance = advance / raster_scale,
+    };
+    try font_value.glyphs.put(.{ .glyph_id = glyph_id }, glyph);
+    if (maybe_codepoint) |codepoint| try font_value.glyphs.put(.{ .codepoint = codepoint }, glyph);
+}
+
+fn bakeTrueTypeBitmapGlyph(font_value: *TextFont, parsed_font: *const cangjie.Font, glyph_id: cangjie.GlyphId, maybe_codepoint: ?u21) !bool {
+    const raster_size = font_value.size_px * @max(font_value.raster_scale, 1.0);
+    const bitmap = (try parsed_font.bitmapGlyphPng(glyph_id, raster_size)) orelse return false;
+    var decoded = try decodePngRgba(font_value.glyphs.allocator, bitmap.data);
+    defer decoded.deinit();
+    if (decoded.width == 0 or decoded.height == 0) return false;
+
+    const region = allocAtlasRegion(font_value, decoded.width, decoded.height) orelse return error.TextAtlasFull;
+    const color_region = allocColorAtlasRegion(font_value, decoded.width, decoded.height) orelse return error.TextAtlasFull;
+    var y: u32 = 0;
+    while (y < decoded.height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < decoded.width) : (x += 1) {
+            const dst = @as(usize, region.y + y) * @as(usize, font_value.atlas_w) + @as(usize, region.x + x);
+            const src = (@as(usize, y) * @as(usize, decoded.width) + x) * 4;
+            font_value.atlas_pixels[dst] = decoded.rgba[src + 3];
+            const color_dst = (@as(usize, color_region.y + y) * @as(usize, font_value.atlas_w) + @as(usize, color_region.x + x)) * 4;
+            @memcpy(font_value.color_atlas_pixels[color_dst .. color_dst + 4], decoded.rgba[src .. src + 4]);
+        }
+    }
+
+    const ppem = if (bitmap.ppem == 0) font_value.size_px else @as(f32, @floatFromInt(bitmap.ppem));
+    const display_scale = font_value.size_px / ppem;
+    const display_w = @as(f32, @floatFromInt(decoded.width)) * display_scale;
+    const display_h = @as(f32, @floatFromInt(decoded.height)) * display_scale;
+    const origin_x = @as(f32, @floatFromInt(bitmap.origin_offset_x)) * display_scale;
+    const origin_y = @as(f32, @floatFromInt(bitmap.origin_offset_y)) * display_scale;
+    const metrics = try parsed_font.horizontalMetrics(glyph_id);
+    const metrics_scale = font_value.size_px / @as(f32, @floatFromInt(parsed_font.units_per_em));
+    const advance = @max(@as(f32, @floatFromInt(metrics.advance_width)) * metrics_scale, display_w);
+    const glyph = TextGlyph{
+        .uv0 = .{
+            @as(f32, @floatFromInt(region.x)) / @as(f32, @floatFromInt(font_value.atlas_w)),
+            @as(f32, @floatFromInt(region.y)) / @as(f32, @floatFromInt(font_value.atlas_h)),
+        },
+        .uv1 = .{
+            @as(f32, @floatFromInt(region.x + decoded.width)) / @as(f32, @floatFromInt(font_value.atlas_w)),
+            @as(f32, @floatFromInt(region.y + decoded.height)) / @as(f32, @floatFromInt(font_value.atlas_h)),
+        },
+        .size = .{ display_w, display_h },
+        .bearing = .{ origin_x, font_value.ascent - origin_y - display_h },
+        .advance = advance,
+    };
+    const color_glyph = TextGlyph{
+        .uv0 = .{
+            @as(f32, @floatFromInt(color_region.x)) / @as(f32, @floatFromInt(font_value.atlas_w)),
+            @as(f32, @floatFromInt(color_region.y)) / @as(f32, @floatFromInt(font_value.atlas_h)),
+        },
+        .uv1 = .{
+            @as(f32, @floatFromInt(color_region.x + decoded.width)) / @as(f32, @floatFromInt(font_value.atlas_w)),
+            @as(f32, @floatFromInt(color_region.y + decoded.height)) / @as(f32, @floatFromInt(font_value.atlas_h)),
+        },
+        .size = glyph.size,
+        .bearing = glyph.bearing,
+        .advance = glyph.advance,
+    };
+    const rgba_copy = try font_value.glyphs.allocator.dupe(u8, decoded.rgba);
+    errdefer font_value.glyphs.allocator.free(rgba_copy);
+    try putColorGlyph(font_value, .{ .glyph_id = glyph_id }, .{
+        .glyph = color_glyph,
+        .width = decoded.width,
+        .height = decoded.height,
+        .rgba_pixels = rgba_copy,
     });
+    try font_value.glyphs.put(.{ .glyph_id = glyph_id }, glyph);
+    if (maybe_codepoint) |codepoint| try font_value.glyphs.put(.{ .codepoint = codepoint }, glyph);
+    return true;
+}
+
+fn putColorGlyph(font_value: *TextFont, key: TextGlyphKey, color_glyph: ColorTextGlyph) !void {
+    if (try font_value.color_glyphs.fetchPut(key, color_glyph)) |old| {
+        font_value.glyphs.allocator.free(old.value.rgba_pixels);
+    }
 }
 
 const GlyphInkBounds = struct {
@@ -1055,6 +1519,134 @@ const GlyphInkBounds = struct {
     x1: u32,
     y1: u32,
 };
+
+const DecodedPngRgba = struct {
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    rgba: []u8,
+
+    fn deinit(self: *DecodedPngRgba) void {
+        self.allocator.free(self.rgba);
+        self.* = undefined;
+    }
+};
+
+fn decodePngRgba(allocator: std.mem.Allocator, png: []const u8) !DecodedPngRgba {
+    if (png.len < 33 or !std.mem.eql(u8, png[0..8], "\x89PNG\r\n\x1a\n")) return error.UnsupportedPng;
+    var pos: usize = 8;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var bit_depth: u8 = 0;
+    var color_type: u8 = 0;
+    var compressed = std.ArrayList(u8).empty;
+    defer compressed.deinit(allocator);
+
+    while (pos + 12 <= png.len) {
+        const len = std.mem.readInt(u32, png[pos..][0..4], .big);
+        const kind = png[pos + 4 .. pos + 8];
+        const data_start = pos + 8;
+        const data_end = data_start + @as(usize, len);
+        if (data_end + 4 > png.len) return error.UnsupportedPng;
+        const chunk = png[data_start..data_end];
+        if (std.mem.eql(u8, kind, "IHDR")) {
+            if (len != 13) return error.UnsupportedPng;
+            width = std.mem.readInt(u32, chunk[0..4], .big);
+            height = std.mem.readInt(u32, chunk[4..8], .big);
+            bit_depth = chunk[8];
+            color_type = chunk[9];
+            if (chunk[10] != 0 or chunk[11] != 0 or chunk[12] != 0) return error.UnsupportedPng;
+        } else if (std.mem.eql(u8, kind, "IDAT")) {
+            try compressed.appendSlice(allocator, chunk);
+        } else if (std.mem.eql(u8, kind, "IEND")) {
+            break;
+        }
+        pos = data_end + 4;
+    }
+    if (width == 0 or height == 0 or bit_depth != 8 or color_type != 6) return error.UnsupportedPng;
+
+    const row_bytes = try std.math.mul(usize, @intCast(width), 4);
+    const expected = try std.math.mul(usize, @intCast(height), row_bytes + 1);
+    var inflated = try inflateZlib(allocator, compressed.items, expected);
+    defer allocator.free(inflated);
+    if (inflated.len != expected) return error.UnsupportedPng;
+
+    var rgba = try allocator.alloc(u8, try std.math.mul(usize, try std.math.mul(usize, @intCast(width), @intCast(height)), 4));
+    errdefer allocator.free(rgba);
+    var prev = try allocator.alloc(u8, row_bytes);
+    defer allocator.free(prev);
+    var row = try allocator.alloc(u8, row_bytes);
+    defer allocator.free(row);
+    @memset(prev, 0);
+
+    var in_pos: usize = 0;
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        const filter = inflated[in_pos];
+        in_pos += 1;
+        @memcpy(row, inflated[in_pos .. in_pos + row_bytes]);
+        in_pos += row_bytes;
+        unfilterPngRow(row, prev, filter, 4) catch return error.UnsupportedPng;
+        @memcpy(rgba[@as(usize, y) * row_bytes .. (@as(usize, y) + 1) * row_bytes], row);
+        std.mem.swap([]u8, &row, &prev);
+    }
+    return .{ .allocator = allocator, .width = width, .height = height, .rgba = rgba };
+}
+
+fn inflateZlib(allocator: std.mem.Allocator, compressed: []const u8, expected_len: usize) ![]u8 {
+    var reader: std.Io.Reader = .fixed(compressed);
+    const out = try allocator.alloc(u8, expected_len);
+    errdefer allocator.free(out);
+    var writer: std.Io.Writer = .fixed(out);
+    var decompress: std.compress.flate.Decompress = .init(&reader, .zlib, &.{});
+    const written = try decompress.reader.streamRemaining(&writer);
+    if (written != expected_len) return error.UnsupportedPng;
+    return out;
+}
+
+fn unfilterPngRow(row: []u8, prev: []const u8, filter: u8, bpp: usize) !void {
+    switch (filter) {
+        0 => {},
+        1 => {
+            for (row, 0..) |*value, i| {
+                const left = if (i >= bpp) row[i - bpp] else 0;
+                value.* +%= left;
+            }
+        },
+        2 => {
+            for (row, 0..) |*value, i| value.* +%= prev[i];
+        },
+        3 => {
+            for (row, 0..) |*value, i| {
+                const left = if (i >= bpp) row[i - bpp] else 0;
+                const up = prev[i];
+                value.* +%= @intCast((@as(u16, left) + @as(u16, up)) / 2);
+            }
+        },
+        4 => {
+            for (row, 0..) |*value, i| {
+                const left = if (i >= bpp) row[i - bpp] else 0;
+                const up = prev[i];
+                const up_left = if (i >= bpp) prev[i - bpp] else 0;
+                value.* +%= paethPredictor(left, up, up_left);
+            }
+        },
+        else => return error.UnsupportedPng,
+    }
+}
+
+fn paethPredictor(a: u8, b: u8, c: u8) u8 {
+    const ai: i32 = a;
+    const bi: i32 = b;
+    const ci: i32 = c;
+    const p = ai + bi - ci;
+    const pa = @abs(p - ai);
+    const pb = @abs(p - bi);
+    const pc = @abs(p - ci);
+    if (pa <= pb and pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
 
 fn glyphInkBounds(target: *const cangjie.RenderTarget) ?GlyphInkBounds {
     var x0: u32 = target.width;
@@ -1077,16 +1669,7 @@ fn glyphInkBounds(target: *const cangjie.RenderTarget) ?GlyphInkBounds {
 }
 
 fn textCoverageContrastByte(value: u8) u8 {
-    const c = @as(f32, @floatFromInt(value)) / 255.0;
-    const adjusted = if (c >= 0.82)
-        1.0
-    else if (c <= 0.08)
-        0.0
-    else blk: {
-        const t = (c - 0.08) / 0.74;
-        break :blk t * t * (3.0 - 2.0 * t);
-    };
-    return @intFromFloat(@round(adjusted * 255.0));
+    return @intCast(@min(@as(u16, 255), (@as(u16, value) * 106 + 50) / 100));
 }
 
 fn getBitmapGlyph(c: u8) [7]u8 {
@@ -1688,7 +2271,7 @@ pub const ImmediateScene = struct {
         const base_font_id = cmd.font_id orelse provider.defaultFontFn(provider.context) orelse return;
         const base_font = provider.fontMetricsFn(provider.context, base_font_id) orelse return;
         var pen_x = cmd.pos[0];
-        var pen_y = cmd.pos[1];
+        var pen_y = textTopLeftY(cmd);
         const line_start_x = pen_x;
         const base_scale = cmd.size / base_font.size_px;
         const line_height = (base_font.ascent - base_font.descent + base_font.line_gap) * base_scale;
@@ -1696,11 +2279,70 @@ pub const ImmediateScene = struct {
         var it = view.iterator();
         var batch_start = self.text_vertices.items.len;
         var batch_font_id = base_font_id;
+        var batch_kind = BatchKind.text;
         const rotation = cmd.rotation;
         const rotate = @abs(rotation) > 0.0001;
         const cos_r = @cos(rotation);
         const sin_r = @sin(rotation);
         const origin = cmd.pos;
+        const shaped_lines = window_draw.shapeTextLines(self.allocator, provider, base_font_id, cmd.text, cmd.size) catch null;
+        if (shaped_lines) |lines| {
+            defer window_draw.freeShapedTextLines(self.allocator, lines);
+            for (lines) |line| {
+                for (line.glyphs) |position| {
+                    if (provider.resolveColorGlyphIdFn(provider.context, @intCast(position.font_index), position.glyph_id)) |color_resolved| {
+                        try self.pushResolvedTextGlyph(
+                            color_resolved,
+                            .color_text,
+                            &batch_start,
+                            &batch_font_id,
+                            &batch_kind,
+                            clip,
+                            pen_x + position.x_offset,
+                            pen_y + position.y_offset,
+                            cmd.size,
+                            cmd.color,
+                            rotate,
+                            origin,
+                            cos_r,
+                            sin_r,
+                            provider,
+                        );
+                        continue;
+                    }
+                    const resolved = provider.resolveGlyphIdFn(provider.context, @intCast(position.font_index), position.glyph_id) orelse continue;
+                    try self.pushResolvedTextGlyph(
+                        resolved,
+                        .text,
+                        &batch_start,
+                        &batch_font_id,
+                        &batch_kind,
+                        clip,
+                        pen_x + position.x_offset,
+                        pen_y + position.y_offset,
+                        cmd.size,
+                        cmd.color,
+                        rotate,
+                        origin,
+                        cos_r,
+                        sin_r,
+                        provider,
+                    );
+                }
+                pen_x = line_start_x;
+                pen_y += line_height;
+            }
+            if (self.text_vertices.items.len > batch_start) {
+                try self.recordBatch(batch_start, clip, batch_kind, batch_font_id, null);
+            }
+            return;
+        }
+
+        pen_x = cmd.pos[0];
+        pen_y = textTopLeftY(cmd);
+        batch_start = self.text_vertices.items.len;
+        batch_font_id = base_font_id;
+        batch_kind = .text;
         while (it.nextCodepoint()) |cp| {
             if (cp == '\n') {
                 pen_x = line_start_x;
@@ -1708,29 +2350,80 @@ pub const ImmediateScene = struct {
                 continue;
             }
             const resolved = provider.resolveGlyphFn(provider.context, base_font_id, cp) orelse continue;
-            if (resolved.font_id != batch_font_id and self.text_vertices.items.len > batch_start) {
-                try self.recordBatch(batch_start, clip, .text, batch_font_id, null);
-                batch_start = self.text_vertices.items.len;
-                batch_font_id = resolved.font_id;
-            }
+            try self.pushResolvedTextGlyph(
+                resolved,
+                .text,
+                &batch_start,
+                &batch_font_id,
+                &batch_kind,
+                clip,
+                pen_x,
+                pen_y,
+                cmd.size,
+                cmd.color,
+                rotate,
+                origin,
+                cos_r,
+                sin_r,
+                provider,
+            );
             const font = provider.fontMetricsFn(provider.context, resolved.font_id) orelse continue;
-            const scale = cmd.size / font.size_px;
-            const gx = pen_x + resolved.glyph.bearing[0] * scale;
-            const gy = pen_y + resolved.glyph.bearing[1] * scale;
-            const gw = resolved.glyph.size[0] * scale;
-            const gh = resolved.glyph.size[1] * scale;
-            if (gw > 0.0 and gh > 0.0) {
-                if (rotate) {
-                    try self.pushTextQuadRotated(gx, gy, gw, gh, resolved.glyph.uv0, resolved.glyph.uv1, cmd.color, origin, cos_r, sin_r);
-                } else {
-                    try self.pushTextQuad(gx, gy, gw, gh, resolved.glyph.uv0, resolved.glyph.uv1, cmd.color);
-                }
-            }
-            pen_x += resolved.glyph.advance * scale;
+            pen_x += resolved.glyph.advance * (cmd.size / font.size_px);
         }
         if (self.text_vertices.items.len > batch_start) {
-            try self.recordBatch(batch_start, clip, .text, batch_font_id, null);
+            try self.recordBatch(batch_start, clip, batch_kind, batch_font_id, null);
         }
+    }
+
+    fn pushResolvedTextGlyph(
+        self: *ImmediateScene,
+        resolved: ResolvedTextGlyph,
+        kind: BatchKind,
+        batch_start: *usize,
+        batch_font_id: *window.TextFontId,
+        batch_kind: *BatchKind,
+        clip: ?window.Rect,
+        pen_x: f32,
+        pen_y: f32,
+        size: f32,
+        color: [4]f32,
+        rotate: bool,
+        origin: [2]f32,
+        cos_r: f32,
+        sin_r: f32,
+        provider: TextProvider,
+    ) !void {
+        if ((resolved.font_id != batch_font_id.* or kind != batch_kind.*) and self.text_vertices.items.len > batch_start.*) {
+            try self.recordBatch(batch_start.*, clip, batch_kind.*, batch_font_id.*, null);
+            batch_start.* = self.text_vertices.items.len;
+            batch_font_id.* = resolved.font_id;
+            batch_kind.* = kind;
+        } else if (resolved.font_id != batch_font_id.*) {
+            batch_font_id.* = resolved.font_id;
+            batch_kind.* = kind;
+        } else if (kind != batch_kind.*) {
+            batch_kind.* = kind;
+        }
+        const font = provider.fontMetricsFn(provider.context, resolved.font_id) orelse return;
+        const scale = size / font.size_px;
+        const gx = pen_x + resolved.glyph.bearing[0] * scale;
+        const gy = pen_y + resolved.glyph.bearing[1] * scale;
+        const gw = resolved.glyph.size[0] * scale;
+        const gh = resolved.glyph.size[1] * scale;
+        if (gw <= 0.0 or gh <= 0.0) return;
+        if (rotate) {
+            try self.pushTextQuadRotated(gx, gy, gw, gh, resolved.glyph.uv0, resolved.glyph.uv1, color, origin, cos_r, sin_r);
+        } else {
+            try self.pushTextQuad(gx, gy, gw, gh, resolved.glyph.uv0, resolved.glyph.uv1, color);
+        }
+    }
+
+    fn textTopLeftY(cmd: anytype) f32 {
+        if (!@hasField(@TypeOf(cmd), "origin")) return cmd.pos[1];
+        return switch (cmd.origin) {
+            .top_left => cmd.pos[1],
+            .baseline => cmd.pos[1] - cmd.baseline,
+        };
     }
 
     pub fn pushTextQuad(self: *ImmediateScene, x: f32, y: f32, w: f32, h: f32, uv0: [2]f32, uv1: [2]f32, color: [4]f32) !void {
@@ -1782,7 +2475,7 @@ pub const ImmediateScene = struct {
         const end_len = switch (kind) {
             .shape => self.vertices.items.len,
             .paint_quad => self.paint_quad_vertices.items.len,
-            .text, .image => self.text_vertices.items.len,
+            .text, .color_text, .image => self.text_vertices.items.len,
             .line_aa => self.line_vertices.items.len,
         };
         const count = end_len - start;
@@ -2263,7 +2956,7 @@ pub const GpuImmediateRenderer = struct {
                             pass.setVertexBuffer(0, tbuf, 0, text_size);
                             pass.setBindGroup(0, uniform_bg, &.{});
                         },
-                        .image => {
+                        .color_text, .image => {
                             pass.setPipeline(image_pipeline);
                             pass.setVertexBuffer(0, tbuf, 0, text_size);
                             pass.setBindGroup(0, uniform_bg, &.{});
@@ -2277,6 +2970,17 @@ pub const GpuImmediateRenderer = struct {
                 }
                 switch (batch.kind) {
                     .text => {
+                        if (batch.font_id) |font_id| {
+                            if (current_font == null or current_font.? != font_id) {
+                                current_font = font_id;
+                                if (resolve_texture(texture_context, batch)) |texture| {
+                                    const bind_group = gctx.lookupResource(texture.bind_group).?;
+                                    pass.setBindGroup(1, bind_group, &.{});
+                                }
+                            }
+                        }
+                    },
+                    .color_text => {
                         if (batch.font_id) |font_id| {
                             if (current_font == null or current_font.? != font_id) {
                                 current_font = font_id;
@@ -2818,12 +3522,115 @@ fn emptyResolveGlyph(_: *anyopaque, _: window.TextFontId, _: u21) ?ResolvedTextG
     return null;
 }
 
+fn emptyResolveGlyphId(_: *anyopaque, _: window.TextFontId, _: cangjie.GlyphId) ?ResolvedTextGlyph {
+    return null;
+}
+
+fn emptyResolveColorGlyphId(_: *anyopaque, _: window.TextFontId, _: cangjie.GlyphId) ?ResolvedTextGlyph {
+    return null;
+}
+
+fn emptyShapeText(_: *anyopaque, _: std.mem.Allocator, _: window.TextFontId, _: []const u8, _: f32) ?[]window_draw.ShapedTextGlyph {
+    return null;
+}
+
 fn emptyTextProvider() TextProvider {
     return .{
         .context = undefined,
         .defaultFontFn = emptyDefaultFont,
         .fontMetricsFn = emptyFontMetrics,
         .resolveGlyphFn = emptyResolveGlyph,
+        .resolveGlyphIdFn = emptyResolveGlyphId,
+        .resolveColorGlyphIdFn = emptyResolveColorGlyphId,
+        .shapeTextFn = emptyShapeText,
+    };
+}
+
+fn unitDefaultFont(_: *anyopaque) ?window.TextFontId {
+    return 0;
+}
+
+fn unitFontMetrics(_: *anyopaque, font_id: window.TextFontId) ?FontMetrics {
+    if (font_id != 0) return null;
+    return .{ .size_px = 10, .ascent = 8, .descent = 2, .line_gap = 0 };
+}
+
+fn unitResolveGlyph(_: *anyopaque, base_font_id: window.TextFontId, codepoint: u21) ?ResolvedTextGlyph {
+    if (base_font_id != 0 or codepoint != 'A') return null;
+    return .{
+        .font_id = 0,
+        .glyph = .{
+            .uv0 = .{ 0, 0 },
+            .uv1 = .{ 1, 1 },
+            .size = .{ 1, 1 },
+            .bearing = .{ 0, 0 },
+            .advance = 1,
+        },
+    };
+}
+
+fn unitResolveGlyphId(_: *anyopaque, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?ResolvedTextGlyph {
+    if (font_id != 0 or glyph_id != 1) return null;
+    return .{
+        .font_id = 0,
+        .glyph = .{
+            .uv0 = .{ 0, 0 },
+            .uv1 = .{ 1, 1 },
+            .size = .{ 1, 1 },
+            .bearing = .{ 0, 0 },
+            .advance = 1,
+        },
+    };
+}
+
+fn unitResolveColorGlyphId(_: *anyopaque, font_id: window.TextFontId, glyph_id: cangjie.GlyphId) ?ResolvedTextGlyph {
+    if (font_id != 0 or glyph_id != 2) return null;
+    return .{
+        .font_id = 0,
+        .glyph = .{
+            .uv0 = .{ 0, 0 },
+            .uv1 = .{ 1, 1 },
+            .size = .{ 2, 2 },
+            .bearing = .{ 0, 0 },
+            .advance = 2,
+        },
+    };
+}
+
+fn unitTextProvider() TextProvider {
+    return .{
+        .context = undefined,
+        .defaultFontFn = unitDefaultFont,
+        .fontMetricsFn = unitFontMetrics,
+        .resolveGlyphFn = unitResolveGlyph,
+        .resolveGlyphIdFn = unitResolveGlyphId,
+        .resolveColorGlyphIdFn = emptyResolveColorGlyphId,
+        .shapeTextFn = emptyShapeText,
+    };
+}
+
+fn unitColorShapeText(_: *anyopaque, allocator: std.mem.Allocator, _: window.TextFontId, text: []const u8, _: f32) ?[]window_draw.ShapedTextGlyph {
+    if (!std.mem.eql(u8, text, "C")) return null;
+    const shaped = allocator.alloc(window_draw.ShapedTextGlyph, 1) catch return null;
+    shaped[0] = .{
+        .font_index = 0,
+        .glyph_id = 2,
+        .x_offset = 0,
+        .y_offset = 0,
+        .x_advance = 2,
+    };
+    return shaped;
+}
+
+fn unitColorTextProvider() TextProvider {
+    return .{
+        .context = undefined,
+        .defaultFontFn = unitDefaultFont,
+        .fontMetricsFn = unitFontMetrics,
+        .resolveGlyphFn = unitResolveGlyph,
+        .resolveGlyphIdFn = unitResolveGlyphId,
+        .resolveColorGlyphIdFn = unitResolveColorGlyphId,
+        .shapeTextFn = unitColorShapeText,
     };
 }
 
@@ -3510,6 +4317,128 @@ test "retained store appends sorted retained vertices" {
     try std.testing.expectEqual(@as(usize, 2), scene.vertices.items.len);
     try std.testing.expectEqual(@as(f32, 1), scene.vertices.items[0].pos[0]);
     try std.testing.expectEqual(@as(f32, 10), scene.vertices.items[1].pos[0]);
+}
+
+test "window gpu baseline origin shifts text vertices to top-left" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 16, 16, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushText(.{
+        .pos = .{ 4, 14 },
+        .size = 10,
+        .color = .{ 1, 1, 1, 1 },
+        .text = "A",
+        .font_id = @as(?window.TextFontId, 0),
+        .origin = window.TextOrigin.baseline,
+        .baseline = 8,
+        .rotation = 0,
+        .layer = 0,
+    }, null, unitTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 6), scene.text_vertices.items.len);
+    try std.testing.expectEqual([2]f32{ 4, 6 }, scene.text_vertices.items[0].pos);
+    try std.testing.expectEqual([2]f32{ 5, 7 }, scene.text_vertices.items[2].pos);
+}
+
+test "text atlas can resolve glyph ids for shaped runs" {
+    var store = try TextAtlasStore.init(std.testing.allocator);
+    defer store.deinit();
+    const font_data = try cangjie.testing.test_font.buildMinimalTtf(std.testing.allocator);
+    errdefer std.testing.allocator.free(font_data);
+    const font_id = try store.createTrueTypeFontUncached(font_data, 20, null, 1);
+
+    const by_id = store.resolveGlyphId(font_id, 1) orelse return error.MissingGlyphId;
+    const by_codepoint = store.resolveGlyph(font_id, 'A') orelse return error.MissingCodepointGlyph;
+    try std.testing.expectEqual(font_id, by_id.font_id);
+    try std.testing.expectEqual(by_codepoint.glyph.advance, by_id.glyph.advance);
+    try std.testing.expectEqual(by_codepoint.glyph.size, by_id.glyph.size);
+
+    const gpu_provider = store.textProvider();
+    const gpu_by_id = gpu_provider.resolveGlyphIdFn(gpu_provider.context, font_id, 1) orelse return error.MissingGlyphId;
+    try std.testing.expectEqual(by_id.glyph.advance, gpu_by_id.glyph.advance);
+
+    const cpu_provider = store.cpuProvider();
+    const cpu_by_id = cpu_provider.resolveGlyphIdFn(cpu_provider.context, @intCast(font_id), 1) orelse return error.MissingGlyphId;
+    try std.testing.expectEqual(by_id.glyph.advance, cpu_by_id.glyph.advance);
+}
+
+test "text atlas color glyph probe does not rebake plain outline glyphs" {
+    var store = try TextAtlasStore.init(std.testing.allocator);
+    defer store.deinit();
+    const font_data = try cangjie.testing.test_font.buildMinimalTtf(std.testing.allocator);
+    errdefer std.testing.allocator.free(font_data);
+    const font_id = try store.createTrueTypeFontUncached(font_data, 20, null, 1);
+
+    const before_count = store.fonts.items[font_id].glyphs.count();
+    const before_cursor = store.fonts.items[font_id].cursor_x;
+    try std.testing.expect(store.resolveColorGlyphId(font_id, 1) == null);
+    try std.testing.expectEqual(before_count, store.fonts.items[font_id].glyphs.count());
+    try std.testing.expectEqual(before_cursor, store.fonts.items[font_id].cursor_x);
+}
+
+test "text atlas shapes positioned glyph offsets for providers" {
+    var store = try TextAtlasStore.init(std.testing.allocator);
+    defer store.deinit();
+    const font_data = try cangjie.testing.test_font.buildMinimalTtf(std.testing.allocator);
+    errdefer std.testing.allocator.free(font_data);
+    const font_id = try store.createTrueTypeFontUncached(font_data, 20, null, 1);
+
+    const direct = store.shapeText(std.testing.allocator, font_id, "AA", 20) orelse return error.MissingShapedText;
+    defer std.testing.allocator.free(direct);
+    try std.testing.expectEqual(@as(usize, 2), direct.len);
+    try std.testing.expectEqual(@as(f32, 0.0), direct[0].x_offset);
+    try std.testing.expect(direct[1].x_offset > direct[0].x_offset);
+    try std.testing.expect(direct[1].x_offset >= direct[0].x_advance - 0.01);
+
+    const gpu_provider = store.textProvider();
+    const gpu_shaped = gpu_provider.shapeTextFn(gpu_provider.context, std.testing.allocator, font_id, "AA", 20) orelse return error.MissingShapedText;
+    defer std.testing.allocator.free(gpu_shaped);
+    try std.testing.expectEqual(direct[1].x_offset, gpu_shaped[1].x_offset);
+
+    const cpu_provider = store.cpuProvider();
+    const cpu_shaped = cpu_provider.shapeTextFn(cpu_provider.context, std.testing.allocator, @intCast(font_id), "AA", 20) orelse return error.MissingShapedText;
+    defer std.testing.allocator.free(cpu_shaped);
+    try std.testing.expectEqual(direct[1].x_offset, cpu_shaped[1].x_offset);
+}
+
+test "window gpu shaped color glyphs record color text batches" {
+    var scene = try ImmediateScene.init(std.testing.allocator, 16, 16, 16, 16);
+    defer scene.deinit();
+    try scene.beginFrame(&.{});
+
+    try scene.pushText(.{
+        .pos = .{ 4, 6 },
+        .size = 10,
+        .color = .{ 1, 1, 1, 1 },
+        .text = "C",
+        .font_id = @as(?window.TextFontId, 0),
+        .origin = window.TextOrigin.top_left,
+        .baseline = 0,
+        .rotation = 0,
+        .layer = 0,
+    }, null, unitColorTextProvider());
+
+    try std.testing.expectEqual(@as(usize, 6), scene.text_vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.batches.items.len);
+    try std.testing.expectEqual(BatchKind.color_text, scene.batches.items[0].kind);
+    try std.testing.expectEqual(@as(?window.TextFontId, 0), scene.batches.items[0].font_id);
+}
+
+test "window gpu decodes simple RGBA PNG for color glyphs" {
+    const png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+        0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xd0,
+        0x00, 0x00, 0x04, 0x81, 0x01, 0x80, 0x2c, 0x55, 0xce, 0xb0, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+    var decoded = try decodePngRgba(std.testing.allocator, &png);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), decoded.width);
+    try std.testing.expectEqual(@as(u32, 1), decoded.height);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 128 }, decoded.rgba);
 }
 
 test "window gpu polylines can use continuous feathered mesh" {

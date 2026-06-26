@@ -72,8 +72,7 @@
         //    .lazy = false,
         //},
         .cangjie = .{
-            .url = "git+https://github.com/passchaos/cangjie#9ad5e4d3c89ce3ce190fb6f3b1de50254eea5272",
-            .hash = "cangjie-0.1.0-Ot2kfUDUDQCiKoBBBnCqK1rQuwU4UBseRf47xfHsvbrI",
+            .path = "../cangjie",
         },
     },
     // Specifies the set of files and directories that are included in this package.

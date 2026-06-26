@@ -1,5 +1,6 @@
 const std = @import("std");
 const cpu = @import("cpu.zig");
+const cangjie = @import("cangjie");
 const scene2d = @import("scene2d.zig");
 const window = @import("window_types.zig");
 const window_lower = @import("window_lower.zig");
@@ -31,19 +32,86 @@ pub const ResolvedGlyph = struct {
     glyph: TextAtlasGlyph,
 };
 
+pub const TextColorGlyph = struct {
+    glyph: TextAtlasGlyph,
+    width: u32,
+    height: u32,
+    rgba_pixels: []const u8,
+};
+
+pub const ShapedTextGlyph = struct {
+    font_index: usize,
+    glyph_id: cangjie.GlyphId,
+    x_offset: f32,
+    y_offset: f32,
+    x_advance: f32,
+};
+
 pub const ResolveGlyphFn = *const fn (context: *anyopaque, base_font_index: usize, codepoint: u21) ?ResolvedGlyph;
+pub const ResolveGlyphIdFn = *const fn (context: *anyopaque, font_index: usize, glyph_id: cangjie.GlyphId) ?ResolvedGlyph;
+pub const ResolveColorGlyphFn = *const fn (context: *anyopaque, base_font_index: usize, codepoint: u21) ?TextColorGlyph;
+pub const ResolveColorGlyphIdFn = *const fn (context: *anyopaque, font_index: usize, glyph_id: cangjie.GlyphId) ?TextColorGlyph;
+pub const ShapeTextFn = *const fn (context: *anyopaque, allocator: std.mem.Allocator, base_font_index: usize, text: []const u8, size: f32) ?[]ShapedTextGlyph;
 pub const TextAtlasProvider = struct {
     context: *anyopaque,
     defaultFontIndexFn: *const fn (context: *anyopaque) ?usize,
     fontCountFn: *const fn (context: *anyopaque) usize,
     fontFn: *const fn (context: *anyopaque, index: usize) ?TextAtlasFont,
     resolveGlyphFn: ResolveGlyphFn,
+    resolveGlyphIdFn: ResolveGlyphIdFn = missingResolveGlyphId,
+    resolveColorGlyphFn: ?ResolveColorGlyphFn = null,
+    resolveColorGlyphIdFn: ?ResolveColorGlyphIdFn = null,
+    shapeTextFn: ShapeTextFn = missingShapeText,
 };
 
 pub const ImageProvider = struct {
     context: *anyopaque,
     imageFn: *const fn (context: *anyopaque, image_id: window.ImageId) ?Image,
 };
+
+pub const ShapedTextLine = struct {
+    glyphs: []ShapedTextGlyph,
+};
+
+fn missingResolveGlyphId(_: *anyopaque, _: usize, _: cangjie.GlyphId) ?ResolvedGlyph {
+    return null;
+}
+
+fn missingShapeText(_: *anyopaque, _: std.mem.Allocator, _: usize, _: []const u8, _: f32) ?[]ShapedTextGlyph {
+    return null;
+}
+
+pub fn shapeTextLines(
+    allocator: std.mem.Allocator,
+    provider: anytype,
+    base_font_index: anytype,
+    text: []const u8,
+    size: f32,
+) ![]ShapedTextLine {
+    var lines = try std.ArrayList(ShapedTextLine).initCapacity(allocator, 0);
+    errdefer {
+        for (lines.items) |line| allocator.free(line.glyphs);
+        lines.deinit(allocator);
+    }
+
+    var line_iter = std.mem.splitScalar(u8, text, '\n');
+    while (line_iter.next()) |line| {
+        const glyphs = if (line.len == 0)
+            try allocator.alloc(ShapedTextGlyph, 0)
+        else
+            provider.shapeTextFn(provider.context, allocator, base_font_index, line, size) orelse return error.TextShapingUnavailable;
+        lines.append(allocator, .{ .glyphs = glyphs }) catch |err| {
+            allocator.free(glyphs);
+            return err;
+        };
+    }
+    return try lines.toOwnedSlice(allocator);
+}
+
+pub fn freeShapedTextLines(allocator: std.mem.Allocator, lines: []ShapedTextLine) void {
+    for (lines) |line| allocator.free(line.glyphs);
+    allocator.free(lines);
+}
 
 pub fn appendDrawListToScene(draw_list: []const window.DrawCmd, dst: *scene2d.Scene2D) !void {
     try appendDrawListToSceneWithImages(draw_list, dst, null);
@@ -387,7 +455,7 @@ fn drawTextCommand(
     const base_scale = cmd.size / base_font.size_px;
     const line_height = (base_font.ascent - base_font.descent + base_font.line_gap) * base_scale;
     var pen_x = cmd.pos[0];
-    var pen_y = cmd.pos[1];
+    var pen_y = textTopLeftY(cmd);
     const line_start_x = pen_x;
     const view = std.unicode.Utf8View.initUnchecked(cmd.text);
     var it = view.iterator();
@@ -420,8 +488,36 @@ fn drawTextCommandWithProviderScaled(cmd: anytype, target: *Image, provider: Tex
     const base_scale = size / base_font.size_px;
     const line_height = (base_font.ascent - base_font.descent + base_font.line_gap) * base_scale;
     var pen_x = cmd.pos[0] * scale_factor;
-    var pen_y = cmd.pos[1] * scale_factor;
+    var pen_y = textTopLeftY(cmd) * scale_factor;
     const line_start_x = pen_x;
+    const shaped_lines = shapeTextLines(target.allocator, provider, base_font_index, cmd.text, size) catch null;
+    if (shaped_lines) |lines| {
+        defer freeShapedTextLines(target.allocator, lines);
+        for (lines) |line| {
+            for (line.glyphs) |position| {
+                if (provider.resolveColorGlyphIdFn) |resolve_color_glyph| {
+                    if (resolve_color_glyph(provider.context, position.font_index, position.glyph_id)) |color_glyph| {
+                        const gx = pen_x + position.x_offset + color_glyph.glyph.bearing[0] * scale_factor;
+                        const gy = pen_y + position.y_offset + color_glyph.glyph.bearing[1] * scale_factor;
+                        blitColorGlyph(target, color_glyph, gx, gy, cmd.color);
+                        continue;
+                    }
+                }
+                const resolved = provider.resolveGlyphIdFn(provider.context, position.font_index, position.glyph_id) orelse continue;
+                const font = provider.fontFn(provider.context, resolved.font_index) orelse continue;
+                const scale = size / font.size_px;
+                const gx = pen_x + position.x_offset + resolved.glyph.bearing[0] * scale;
+                const gy = pen_y + position.y_offset + resolved.glyph.bearing[1] * scale;
+                blitGlyph(target, font, resolved.glyph, gx, gy, scale, cmd.color);
+            }
+            pen_x = line_start_x;
+            pen_y += line_height;
+        }
+        return;
+    }
+
+    pen_x = line_start_x;
+    pen_y = textTopLeftY(cmd) * scale_factor;
     const view = std.unicode.Utf8View.initUnchecked(cmd.text);
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
@@ -429,6 +525,15 @@ fn drawTextCommandWithProviderScaled(cmd: anytype, target: *Image, provider: Tex
             pen_x = line_start_x;
             pen_y += line_height;
             continue;
+        }
+        if (provider.resolveColorGlyphFn) |resolve_color_glyph| {
+            if (resolve_color_glyph(provider.context, base_font_index, cp)) |color_glyph| {
+                const gx = pen_x + color_glyph.glyph.bearing[0];
+                const gy = pen_y + color_glyph.glyph.bearing[1];
+                blitColorGlyph(target, color_glyph, gx, gy, cmd.color);
+                pen_x += color_glyph.glyph.advance;
+                continue;
+            }
         }
         const resolved = provider.resolveGlyphFn(provider.context, base_font_index, cp) orelse continue;
         if (resolved.font_index >= provider.fontCountFn(provider.context)) continue;
@@ -439,6 +544,43 @@ fn drawTextCommandWithProviderScaled(cmd: anytype, target: *Image, provider: Tex
         blitGlyphRotated(target, font, resolved.glyph, gx, gy, scale, cmd.color, .{ cmd.pos[0] * scale_factor, cmd.pos[1] * scale_factor }, cmd.rotation, scaledClipRect(clip, scale_factor));
         pen_x += resolved.glyph.advance * scale;
     }
+}
+
+fn blitColorGlyph(target: *Image, color_glyph: TextColorGlyph, x: f32, y: f32, tint: [4]f32) void {
+    if (color_glyph.width == 0 or color_glyph.height == 0) return;
+    if (color_glyph.rgba_pixels.len < @as(usize, color_glyph.width) * @as(usize, color_glyph.height) * 4) return;
+    const dst_w: i32 = @intFromFloat(@ceil(color_glyph.glyph.size[0]));
+    const dst_h: i32 = @intFromFloat(@ceil(color_glyph.glyph.size[1]));
+    if (dst_w <= 0 or dst_h <= 0) return;
+    const tint_alpha = std.math.clamp(tint[3], 0.0, 1.0);
+    var dy: i32 = 0;
+    while (dy < dst_h) : (dy += 1) {
+        const py = @as(i32, @intFromFloat(@floor(y))) + dy;
+        if (py < 0 or py >= @as(i32, @intCast(target.height))) continue;
+        const sy: u32 = @intCast(@divTrunc(dy * @as(i32, @intCast(color_glyph.height)), dst_h));
+        var dx: i32 = 0;
+        while (dx < dst_w) : (dx += 1) {
+            const px = @as(i32, @intFromFloat(@floor(x))) + dx;
+            if (px < 0 or px >= @as(i32, @intCast(target.width))) continue;
+            const sx: u32 = @intCast(@divTrunc(dx * @as(i32, @intCast(color_glyph.width)), dst_w));
+            const src = (@as(usize, sy) * color_glyph.width + sx) * 4;
+            const alpha: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(color_glyph.rgba_pixels[src + 3])) * tint_alpha));
+            if (alpha == 0) continue;
+            target.blendPixel(
+                @intCast(px),
+                @intCast(py),
+                Color.rgba(color_glyph.rgba_pixels[src + 0], color_glyph.rgba_pixels[src + 1], color_glyph.rgba_pixels[src + 2], alpha),
+            );
+        }
+    }
+}
+
+fn textTopLeftY(cmd: anytype) f32 {
+    if (!@hasField(@TypeOf(cmd), "origin")) return cmd.pos[1];
+    return switch (cmd.origin) {
+        .top_left => cmd.pos[1],
+        .baseline => cmd.pos[1] - cmd.baseline,
+    };
 }
 
 fn blitGlyph(target: *Image, font: TextAtlasFont, glyph: TextAtlasGlyph, x: f32, y: f32, scale: f32, color: [4]f32) void {
@@ -690,6 +832,50 @@ fn mixColor(a: Color, b: Color, t: f32) Color {
 fn mixByte(a: u8, b: u8, t: f32) u8 {
     const value = @as(f32, @floatFromInt(a)) + (@as(f32, @floatFromInt(b)) - @as(f32, @floatFromInt(a))) * std.math.clamp(t, 0.0, 1.0);
     return @intFromFloat(@round(std.math.clamp(value, 0.0, 255.0)));
+}
+
+fn sampleGlyphAlpha(font: TextAtlasFont, src_x: u32, src_y: u32, src_w: u32, src_h: u32, dst_x: i32, dst_y: i32, dst_w: i32, dst_h: i32) u8 {
+    if (src_w == 0 or src_h == 0 or dst_w <= 0 or dst_h <= 0) return 0;
+    const src_w_f: f32 = @floatFromInt(src_w);
+    const src_h_f: f32 = @floatFromInt(src_h);
+    const dst_w_f: f32 = @floatFromInt(dst_w);
+    const dst_h_f: f32 = @floatFromInt(dst_h);
+    const x0 = @as(f32, @floatFromInt(dst_x)) * src_w_f / dst_w_f;
+    const x1 = @as(f32, @floatFromInt(dst_x + 1)) * src_w_f / dst_w_f;
+    const y0 = @as(f32, @floatFromInt(dst_y)) * src_h_f / dst_h_f;
+    const y1 = @as(f32, @floatFromInt(dst_y + 1)) * src_h_f / dst_h_f;
+
+    const ix0: i32 = @intFromFloat(@floor(x0));
+    const ix1: i32 = @intFromFloat(@ceil(x1));
+    const iy0: i32 = @intFromFloat(@floor(y0));
+    const iy1: i32 = @intFromFloat(@ceil(y1));
+
+    var weighted_sum: f32 = 0.0;
+    var area_sum: f32 = 0.0;
+    var sy = iy0;
+    while (sy < iy1) : (sy += 1) {
+        if (sy < 0 or sy >= @as(i32, @intCast(src_h))) continue;
+        const py0 = @max(y0, @as(f32, @floatFromInt(sy)));
+        const py1 = @min(y1, @as(f32, @floatFromInt(sy + 1)));
+        const wy = py1 - py0;
+        if (wy <= 0.0) continue;
+        var sx = ix0;
+        while (sx < ix1) : (sx += 1) {
+            if (sx < 0 or sx >= @as(i32, @intCast(src_w))) continue;
+            const px0 = @max(x0, @as(f32, @floatFromInt(sx)));
+            const px1 = @min(x1, @as(f32, @floatFromInt(sx + 1)));
+            const wx = px1 - px0;
+            if (wx <= 0.0) continue;
+            const area = wx * wy;
+            const atlas_x: u32 = src_x + @as(u32, @intCast(sx));
+            const atlas_y: u32 = src_y + @as(u32, @intCast(sy));
+            const alpha = font.atlas_pixels[@as(usize, atlas_y) * font.atlas_w + atlas_x];
+            weighted_sum += @as(f32, @floatFromInt(alpha)) * area;
+            area_sum += area;
+        }
+    }
+    if (area_sum <= 0.0) return 0;
+    return @intFromFloat(@round(std.math.clamp(weighted_sum / area_sum, 0.0, 255.0)));
 }
 
 fn toRect(rect: window.Rect) Rect {
@@ -1002,4 +1188,48 @@ test "window draw image provider applies tint in CPU scene path" {
     try std.testing.expect(px.g >= 20 and px.g <= 30);
     try std.testing.expect(px.b >= 45 and px.b <= 55);
     try std.testing.expect(px.a >= 120 and px.a <= 130);
+}
+
+test "window_draw baseline origin shifts text blit to top-left" {
+    var image = try Image.init(std.testing.allocator, 24, 24, .transparent);
+    defer image.deinit();
+
+    const atlas_pixels = [_]u8{255};
+    const fonts = [_]TextAtlasFont{.{
+        .size_px = 10,
+        .ascent = 8,
+        .descent = 2,
+        .line_gap = 0,
+        .atlas_w = 1,
+        .atlas_h = 1,
+        .atlas_pixels = &atlas_pixels,
+    }};
+    const draw_list = [_]window.DrawCmd{.{ .text = .{
+        .pos = .{ 4, 14 },
+        .size = 10,
+        .color = .{ 1, 1, 1, 1 },
+        .text = "A",
+        .font_id = 0,
+        .origin = .baseline,
+        .baseline = 8,
+        .layer = 0,
+    } }};
+
+    drawTextCommands(&draw_list, &image, &fonts, 0, undefined, resolveUnitGlyph);
+
+    try std.testing.expectEqual(Color.rgba(255, 255, 255, 255), image.pixel(4, 6).?);
+    try std.testing.expectEqual(Color.transparent, image.pixel(4, 14).?);
+}
+
+fn resolveUnitGlyph(_: *anyopaque, _: usize, _: u21) ?ResolvedGlyph {
+    return .{
+        .font_index = 0,
+        .glyph = .{
+            .uv0 = .{ 0, 0 },
+            .uv1 = .{ 1, 1 },
+            .size = .{ 1, 1 },
+            .bearing = .{ 0, 0 },
+            .advance = 1,
+        },
+    };
 }

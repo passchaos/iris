@@ -98,6 +98,10 @@ pub const Renderer = struct {
         try self.renderer.pushDrawList(cmds);
     }
 
+    pub fn textDebugSnapshot(self: *const Renderer) window_gpu.WindowTextDebugSnapshot {
+        return self.renderer.textDebugSnapshot();
+    }
+
     pub fn createImage(self: *Renderer, width: u32, height: u32, rgba_pixels: []const u8) !window.ImageId {
         return try self.renderer.createImage(width, height, rgba_pixels);
     }
