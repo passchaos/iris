@@ -22,7 +22,7 @@ pub fn lowerDrawList(
     }
 }
 
-fn lowerCommand(comptime Sink: type, sink: *Sink, cmd: window.DrawCmd, clip: ?window.Rect) !void {
+pub fn lowerCommand(comptime Sink: type, sink: *Sink, cmd: window.DrawCmd, clip: ?window.Rect) !void {
     switch (cmd) {
         .rect => |c| try sink.rect(c, clip),
         .fill_path => |c| try sink.fillPath(c, clip),

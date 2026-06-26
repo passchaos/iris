@@ -294,6 +294,10 @@ const SceneSink = struct {
     pub fn image(self: *SceneSink, image_cmd: anytype, _: ?window.Rect) !void {
         if (self.image_provider) |provider| {
             if (provider.imageFn(provider.context, image_cmd.image_id)) |image_value| {
+                if (isWhiteTint(image_cmd.tint)) {
+                    try self.scene.fillImageRect(toRect(image_cmd.rect), &image_value);
+                    return;
+                }
                 var tinted = try tintImage(self.scene.allocator, &image_value, image_cmd.tint);
                 defer tinted.deinit();
                 try self.scene.fillImageRect(toRect(image_cmd.rect), &tinted);
@@ -313,48 +317,66 @@ pub fn renderDrawListCpu(
     image_provider: ?ImageProvider,
     scale_factor: f32,
 ) !void {
-    const scale = @max(0.25, scale_factor);
     var clip_stack = try std.ArrayList(window.Rect).initCapacity(dst.allocator, 8);
     defer clip_stack.deinit(dst.allocator);
-    var scene_dirty = false;
+    try renderDrawListCpuWithScratch(draw_list, dst, renderer, target, text_provider, image_provider, scale_factor, &clip_stack);
+}
 
+pub fn renderDrawListCpuWithScratch(
+    draw_list: []const window.DrawCmd,
+    dst: *scene2d.Scene2D,
+    renderer: *cpu.CpuRenderer,
+    target: *Image,
+    text_provider: ?TextAtlasProvider,
+    image_provider: ?ImageProvider,
+    scale_factor: f32,
+    clip_stack: *std.ArrayList(window.Rect),
+) !void {
+    const scale = @max(0.25, scale_factor);
+    var scene_dirty = false;
+    var sink = SceneSink{ .scene = dst, .image_provider = image_provider };
+
+    clip_stack.clearRetainingCapacity();
     dst.clear();
     dst.scale(scale, scale);
 
     for (draw_list) |cmd| {
         switch (cmd) {
             .paint_quad => |quad| {
-                try flushScene(dst, renderer, target, &clip_stack, scale, &scene_dirty);
+                if (currentClipIsEmpty(clip_stack.items)) continue;
+                try flushScene(dst, renderer, target, clip_stack, scale, &scene_dirty);
                 drawPaintQuad(target, quad, scale, currentClip(clip_stack.items));
             },
             .text => |text| {
-                try flushScene(dst, renderer, target, &clip_stack, scale, &scene_dirty);
+                if (currentClipIsEmpty(clip_stack.items)) continue;
+                try flushScene(dst, renderer, target, clip_stack, scale, &scene_dirty);
                 if (text_provider) |provider| {
                     drawTextCommandWithProviderScaled(text, target, provider, scale, currentClip(clip_stack.items));
                 }
             },
             .clip_begin => |clip| {
-                try appendOneDrawCommandToScene(cmd, dst, image_provider);
-                try clip_stack.append(dst.allocator, effectiveClip(currentClip(clip_stack.items), clip));
-                scene_dirty = true;
+                const effective = effectiveClip(currentClip(clip_stack.items), clip);
+                try clip_stack.append(dst.allocator, effective);
+                try dst.pushClipRect(toRect(effective));
             },
             .clip_end => {
-                try appendOneDrawCommandToScene(cmd, dst, image_provider);
-                _ = clip_stack.pop();
-                scene_dirty = true;
+                if (clip_stack.items.len > 0) {
+                    _ = clip_stack.pop();
+                    dst.popClip();
+                }
             },
             else => {
-                try appendOneDrawCommandToScene(cmd, dst, image_provider);
+                if (currentClipIsEmpty(clip_stack.items)) continue;
+                try appendOneDrawCommandToScene(&sink, cmd);
                 scene_dirty = true;
             },
         }
     }
-    try flushScene(dst, renderer, target, &clip_stack, scale, &scene_dirty);
+    try flushScene(dst, renderer, target, clip_stack, scale, &scene_dirty);
 }
 
-fn appendOneDrawCommandToScene(cmd: window.DrawCmd, dst: *scene2d.Scene2D, image_provider: ?ImageProvider) !void {
-    const one = [_]window.DrawCmd{cmd};
-    try appendDrawListToSceneWithImages(&one, dst, image_provider);
+fn appendOneDrawCommandToScene(sink: *SceneSink, cmd: window.DrawCmd) !void {
+    try window_lower.lowerCommand(SceneSink, sink, cmd, null);
 }
 
 fn flushScene(
@@ -376,6 +398,11 @@ fn flushScene(
 fn currentClip(stack: []const window.Rect) ?window.Rect {
     if (stack.len == 0) return null;
     return stack[stack.len - 1];
+}
+
+fn currentClipIsEmpty(stack: []const window.Rect) bool {
+    const clip = currentClip(stack) orelse return false;
+    return clip.w <= 0.0 or clip.h <= 0.0;
 }
 
 fn effectiveClip(current: ?window.Rect, next: window.Rect) window.Rect {
@@ -482,7 +509,8 @@ fn drawTextCommandWithProvider(cmd: anytype, target: *Image, provider: TextAtlas
 
 fn drawTextCommandWithProviderScaled(cmd: anytype, target: *Image, provider: TextAtlasProvider, scale_factor: f32, clip: ?window.Rect) void {
     const base_font_index = if (cmd.font_id) |font_id| @as(usize, @intCast(font_id)) else provider.defaultFontIndexFn(provider.context) orelse return;
-    if (base_font_index >= provider.fontCountFn(provider.context)) return;
+    const font_count = provider.fontCountFn(provider.context);
+    if (base_font_index >= font_count) return;
     const base_font = provider.fontFn(provider.context, base_font_index) orelse return;
     const size = cmd.size * scale_factor;
     const base_scale = size / base_font.size_px;
@@ -490,6 +518,8 @@ fn drawTextCommandWithProviderScaled(cmd: anytype, target: *Image, provider: Tex
     var pen_x = cmd.pos[0] * scale_factor;
     var pen_y = textTopLeftY(cmd) * scale_factor;
     const line_start_x = pen_x;
+    const origin = .{ cmd.pos[0] * scale_factor, cmd.pos[1] * scale_factor };
+    const pixel_clip = scaledClipRect(clip, scale_factor);
     const shaped_lines = shapeTextLines(target.allocator, provider, base_font_index, cmd.text, size) catch null;
     if (shaped_lines) |lines| {
         defer freeShapedTextLines(target.allocator, lines);
@@ -536,12 +566,12 @@ fn drawTextCommandWithProviderScaled(cmd: anytype, target: *Image, provider: Tex
             }
         }
         const resolved = provider.resolveGlyphFn(provider.context, base_font_index, cp) orelse continue;
-        if (resolved.font_index >= provider.fontCountFn(provider.context)) continue;
+        if (resolved.font_index >= font_count) continue;
         const font = provider.fontFn(provider.context, resolved.font_index) orelse continue;
         const scale = size / font.size_px;
         const gx = pen_x + resolved.glyph.bearing[0] * scale;
         const gy = pen_y + resolved.glyph.bearing[1] * scale;
-        blitGlyphRotated(target, font, resolved.glyph, gx, gy, scale, cmd.color, .{ cmd.pos[0] * scale_factor, cmd.pos[1] * scale_factor }, cmd.rotation, scaledClipRect(clip, scale_factor));
+        blitGlyphRotated(target, font, resolved.glyph, gx, gy, scale, cmd.color, origin, cmd.rotation, pixel_clip);
         pen_x += resolved.glyph.advance * scale;
     }
 }
@@ -766,13 +796,14 @@ fn drawPaintQuad(target: *Image, quad: window.PaintQuad, scale: f32, clip: ?wind
     const background = toColor(quad.background);
     const border = toColor(quad.border_color);
     const aa: f32 = 0.75;
+    const sdf = RoundedRectSdfParams.init(rect, radius);
     var y = y0;
     while (y < y1) : (y += 1) {
         var x = x0;
         while (x < x1) : (x += 1) {
             const px = @as(f32, @floatFromInt(x)) + 0.5;
             const py = @as(f32, @floatFromInt(y)) + 0.5;
-            const d = roundedRectSdf(px, py, rect, radius);
+            const d = roundedRectSdf(px, py, sdf);
             const outer_alpha = 1.0 - smoothstep(-aa, aa, d);
             if (outer_alpha <= 0.0) continue;
 
@@ -790,16 +821,32 @@ fn drawPaintQuad(target: *Image, quad: window.PaintQuad, scale: f32, clip: ?wind
     }
 }
 
-fn roundedRectSdf(px: f32, py: f32, rect: window.Rect, radius: f32) f32 {
-    const half_w = rect.w * 0.5;
-    const half_h = rect.h * 0.5;
-    const cx = rect.x + half_w;
-    const cy = rect.y + half_h;
-    const qx = @abs(px - cx) - (half_w - radius);
-    const qy = @abs(py - cy) - (half_h - radius);
+const RoundedRectSdfParams = struct {
+    cx: f32,
+    cy: f32,
+    inner_half_w: f32,
+    inner_half_h: f32,
+    radius: f32,
+
+    fn init(rect: window.Rect, radius: f32) RoundedRectSdfParams {
+        const half_w = rect.w * 0.5;
+        const half_h = rect.h * 0.5;
+        return .{
+            .cx = rect.x + half_w,
+            .cy = rect.y + half_h,
+            .inner_half_w = half_w - radius,
+            .inner_half_h = half_h - radius,
+            .radius = radius,
+        };
+    }
+};
+
+fn roundedRectSdf(px: f32, py: f32, params: RoundedRectSdfParams) f32 {
+    const qx = @abs(px - params.cx) - params.inner_half_w;
+    const qy = @abs(py - params.cy) - params.inner_half_h;
     const ox = @max(qx, 0.0);
     const oy = @max(qy, 0.0);
-    return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0.0) - radius;
+    return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0.0) - params.radius;
 }
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) f32 {
@@ -1154,6 +1201,65 @@ test "window CPU paint quad clips to intersection with quad bounds" {
     try std.testing.expectEqual(Color.transparent, image.pixel(8, 8).?);
 }
 
+test "window CPU direct commands keep clip without empty scene flush" {
+    var image = try Image.init(std.testing.allocator, 8, 8, .transparent);
+    defer image.deinit();
+    var scene = scene2d.Scene2D.init(std.testing.allocator);
+    defer scene.deinit();
+    var renderer = cpu.CpuRenderer.init(std.testing.allocator);
+    renderer.stats.strips_emitted = 99;
+    var clip_stack = try std.ArrayList(window.Rect).initCapacity(std.testing.allocator, 1);
+    defer clip_stack.deinit(std.testing.allocator);
+
+    const cmds = [_]window.DrawCmd{
+        .{ .clip_begin = .{ .x = 2, .y = 2, .w = 2, .h = 2 } },
+        .{ .paint_quad = .{
+            .rect = .{ .x = 1, .y = 1, .w = 6, .h = 6 },
+            .radius = 0,
+            .background = .{ 1, 0, 0, 1 },
+            .border_width = 0,
+            .layer = 0,
+        } },
+        .{ .clip_end = {} },
+    };
+    try renderDrawListCpuWithScratch(&cmds, &scene, &renderer, &image, null, null, 1.0, &clip_stack);
+
+    try std.testing.expectEqual(@as(usize, 99), renderer.stats.strips_emitted);
+    try std.testing.expect(image.pixel(2, 2).?.a > 0);
+    try std.testing.expectEqual(Color.transparent, image.pixel(1, 1).?);
+    try std.testing.expectEqual(Color.transparent, image.pixel(4, 2).?);
+}
+
+test "window CPU scene commands retain clip after direct flush" {
+    var image = try Image.init(std.testing.allocator, 8, 8, .transparent);
+    defer image.deinit();
+    var scene = scene2d.Scene2D.init(std.testing.allocator);
+    defer scene.deinit();
+    var renderer = cpu.CpuRenderer.init(std.testing.allocator);
+    var clip_stack = try std.ArrayList(window.Rect).initCapacity(std.testing.allocator, 1);
+    defer clip_stack.deinit(std.testing.allocator);
+
+    const cmds = [_]window.DrawCmd{
+        .{ .clip_begin = .{ .x = 2, .y = 2, .w = 2, .h = 2 } },
+        .{ .rect = .{ .rect = .{ .x = 0, .y = 0, .w = 6, .h = 6 }, .color = .{ 0, 1, 0, 1 }, .layer = 0 } },
+        .{ .paint_quad = .{
+            .rect = .{ .x = 3, .y = 3, .w = 1, .h = 1 },
+            .radius = 0,
+            .background = .{ 1, 0, 0, 1 },
+            .border_width = 0,
+            .layer = 0,
+        } },
+        .{ .clip_end = {} },
+        .{ .rect = .{ .rect = .{ .x = 6, .y = 6, .w = 1, .h = 1 }, .color = .{ 0, 0, 1, 1 }, .layer = 0 } },
+    };
+    try renderDrawListCpuWithScratch(&cmds, &scene, &renderer, &image, null, null, 1.0, &clip_stack);
+
+    try std.testing.expect(image.pixel(2, 2).?.g > 0);
+    try std.testing.expectEqual(Color.transparent, image.pixel(1, 1).?);
+    try std.testing.expect(image.pixel(3, 3).?.r > 0);
+    try std.testing.expectEqual(Color.blue, image.pixel(6, 6).?);
+}
+
 test "window draw image provider applies tint in CPU scene path" {
     var source = try Image.init(std.testing.allocator, 1, 1, .transparent);
     defer source.deinit();
@@ -1188,6 +1294,38 @@ test "window draw image provider applies tint in CPU scene path" {
     try std.testing.expect(px.g >= 20 and px.g <= 30);
     try std.testing.expect(px.b >= 45 and px.b <= 55);
     try std.testing.expect(px.a >= 120 and px.a <= 130);
+}
+
+test "window draw image provider keeps white tint pixels on CPU scene path" {
+    var source = try Image.init(std.testing.allocator, 1, 1, .transparent);
+    defer source.deinit();
+    source.writePixel(0, 0, Color.rgba(20, 40, 80, 200));
+
+    const Provider = struct {
+        var image: *Image = undefined;
+        fn imageFn(_: *anyopaque, image_id: window.ImageId) ?Image {
+            return if (image_id == 11) image.* else null;
+        }
+    };
+    Provider.image = &source;
+    const provider = ImageProvider{ .context = undefined, .imageFn = Provider.imageFn };
+
+    var scene = scene2d.Scene2D.init(std.testing.allocator);
+    defer scene.deinit();
+    const cmds = [_]window.DrawCmd{.{ .image = .{
+        .image_id = 11,
+        .rect = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        .tint = .{ 1.0, 1.0, 1.0, 1.0 },
+        .layer = 0,
+    } }};
+    try appendDrawListToSceneWithImages(&cmds, &scene, provider);
+
+    var out = try Image.init(std.testing.allocator, 1, 1, .transparent);
+    defer out.deinit();
+    var renderer = cpu.CpuRenderer.init(std.testing.allocator);
+    try renderer.render2D(&scene, &out);
+
+    try std.testing.expectEqual(Color.rgba(16, 31, 63, 157), out.pixel(0, 0).?);
 }
 
 test "window_draw baseline origin shifts text blit to top-left" {

@@ -373,6 +373,7 @@ pub const CpuWindowRenderer = struct {
     target: Image,
     scene: scene2d.Scene2D,
     draw_cmds: std.ArrayList(window_types.DrawCmd),
+    clip_stack: std.ArrayList(window_types.Rect),
     renderer: cpu.CpuRenderer,
     text_provider: ?window_draw.TextAtlasProvider = null,
     image_provider: ?window_draw.ImageProvider = null,
@@ -385,6 +386,7 @@ pub const CpuWindowRenderer = struct {
             .target = try Image.init(allocator, width, height, .transparent),
             .scene = scene2d.Scene2D.init(allocator),
             .draw_cmds = try std.ArrayList(window_types.DrawCmd).initCapacity(allocator, 512),
+            .clip_stack = try std.ArrayList(window_types.Rect).initCapacity(allocator, 8),
             .renderer = cpu.CpuRenderer.init(allocator),
         };
     }
@@ -395,6 +397,7 @@ pub const CpuWindowRenderer = struct {
 
     pub fn deinit(self: *CpuWindowRenderer) void {
         self.renderer.deinit();
+        self.clip_stack.deinit(self.allocator);
         self.draw_cmds.deinit(self.allocator);
         self.scene.deinit();
         self.target.deinit();
@@ -403,8 +406,8 @@ pub const CpuWindowRenderer = struct {
     }
 
     pub fn beginFrame(self: *CpuWindowRenderer, width: u32, height: u32) !void {
-        self.scene.clear();
         self.draw_cmds.clearRetainingCapacity();
+        self.clip_stack.clearRetainingCapacity();
         try self.ensureTarget(width, height);
         self.target.clear(.{ .r = 20, .g = 25, .b = 33, .a = 255 });
     }
@@ -422,8 +425,7 @@ pub const CpuWindowRenderer = struct {
     }
 
     pub fn endFrame(self: *CpuWindowRenderer) !void {
-        self.scene.clear();
-        try window_draw.renderDrawListCpu(
+        try window_draw.renderDrawListCpuWithScratch(
             self.draw_cmds.items,
             &self.scene,
             &self.renderer,
@@ -431,6 +433,7 @@ pub const CpuWindowRenderer = struct {
             self.text_provider,
             self.image_provider,
             self.scale_factor,
+            &self.clip_stack,
         );
         try self.presenter.present(&self.target);
     }
